@@ -1,0 +1,72 @@
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+
+def print_error(error):
+    message = str(error)
+    key = os.environ.get("NEBIUS_API_KEY")
+    if key:
+        message = message.replace(key, "[REDACTED]")
+    print(f"{type(error).__name__}: {message}")
+
+
+def main():
+    try:
+        client = OpenAI(
+            base_url=os.getenv(
+                "NEBIUS_BASE_URL",
+                "https://api.tokenfactory.us-central1.nebius.com/v1/",
+            ),
+            api_key=os.environ["NEBIUS_API_KEY"],
+        )
+    except Exception as error:
+        print_error(error)
+        return
+
+    model_ids = []
+    try:
+        model_ids = [model.id for model in client.models.list()]
+        for model_id in model_ids:
+            if "nemotron" in model_id.lower() or "embed" in model_id.lower():
+                print(model_id)
+    except Exception as error:
+        print_error(error)
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("NEBIUS_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+            messages=[{"role": "user", "content": "Say hello in one sentence."}],
+            max_tokens=300,
+        )
+        print(response.choices[0].message.content)
+        if response.usage is not None:
+            print(f"prompt_tokens: {response.usage.prompt_tokens}")
+            print(f"completion_tokens: {response.usage.completion_tokens}")
+            print(f"total_tokens: {response.usage.total_tokens}")
+        else:
+            print("Usage token counts were not returned.")
+    except Exception as error:
+        print_error(error)
+
+    try:
+        embedding_model = next(
+            (model_id for model_id in model_ids if "qwen3-embedding" in model_id.lower()),
+            None,
+        )
+        if embedding_model is None:
+            raise ValueError("No listed model ID contains 'qwen3-embedding'.")
+        print(f"Embedding model: {embedding_model}")
+        response = client.embeddings.create(model=embedding_model, input="hello world")
+        print(f"Vector length: {len(response.data[0].embedding)}")
+    except Exception as error:
+        print_error(error)
+
+
+if __name__ == "__main__":
+    main()
