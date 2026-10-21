@@ -5,6 +5,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -14,10 +16,20 @@ DB_PATH = PROJECT_ROOT / "data" / "app.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-def get_client():
+def get_api_key():
     key = os.environ.get("NEBIUS_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets.get("NEBIUS_API_KEY")
+    except (StreamlitSecretNotFoundError, FileNotFoundError):
+        return None
+
+
+def get_client():
+    key = get_api_key()
     if not key:
-        raise RuntimeError("NEBIUS_API_KEY is missing from the environment.")
+        raise RuntimeError("NEBIUS_API_KEY is missing from the environment and Streamlit secrets.")
     return OpenAI(
         api_key=key,
         base_url=os.getenv(
@@ -29,7 +41,7 @@ def get_client():
 
 def safe_error(error):
     message = str(error)
-    key = os.environ.get("NEBIUS_API_KEY")
+    key = get_api_key()
     if key:
         message = message.replace(key, "[REDACTED]")
     return f"{type(error).__name__}: {message}"
