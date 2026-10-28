@@ -7,15 +7,27 @@ from pathlib import Path
 import numpy as np
 
 if __package__:
-    from .workspaces import get_storage, ensure_workspace
+    from .workspaces import get_storage, ensure_workspace, bound_database_identity, database_identity, WorkspaceError
 else:
-    from workspaces import get_storage, ensure_workspace
+    from workspaces import get_storage, ensure_workspace, bound_database_identity, database_identity, WorkspaceError
 
 
 def connect():
     storage = get_storage()
-    ensure_workspace(storage)
-    connection = sqlite3.connect(storage.db_path, timeout=30)
+    identity = bound_database_identity()
+    if identity is not None:
+        if database_identity(storage) != identity:
+            raise WorkspaceError("This workspace changed while the answer was running.")
+        connection = sqlite3.connect(storage.db_path.as_uri() + "?mode=rw", timeout=30, uri=True)
+        try:
+            if database_identity(storage) != identity:
+                raise WorkspaceError("This workspace changed while the answer was running.")
+        except BaseException:
+            connection.close()
+            raise
+    else:
+        ensure_workspace(storage)
+        connection = sqlite3.connect(storage.db_path, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection

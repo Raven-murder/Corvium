@@ -18,7 +18,13 @@ from .demo import seed_demo, reset_demo
 
 def initialize_chat_selection(state, chats):
     if not chats or not state.get("selected_chat_id"):
-        state["selected_chat_id"] = initial_chat_id(chats)
+        from .jobs import running_job
+
+        job = running_job(state["workspace_id"]) if state.get("workspace_id") else None
+        if job is not None and job["chat_id"] in {chat["id"] for chat in chats}:
+            state["selected_chat_id"] = job["chat_id"]
+        else:
+            state["selected_chat_id"] = initial_chat_id(chats)
         chats = list_chats()
     if state.get("selected_chat_id") not in {chat["id"] for chat in chats}:
         state["selected_chat_id"] = most_recent_chat_id(chats)
@@ -507,3 +513,38 @@ def open_bookmark(state, bookmark_id):
     if bookmark is None:
         raise notes.NotesError("This bookmark is no longer available.")
     request_viewer(state, bookmark["doc_id"], bookmark["locator"])
+
+
+def submit_answer_job(state, question, diagram_parameters=None):
+    from .jobs import start_job
+    from .diagrams import diagram_language
+
+    job = start_job(state["workspace_id"], state["selected_chat_id"], question,
+                    diagram_parameters=diagram_parameters, language=diagram_language())
+    state["view"] = "chat"
+    return job
+
+
+def stop_answer_job(state, chat_id, job_id):
+    from .jobs import cancel_job
+
+    cancel_job(state["workspace_id"], chat_id, job_id)
+
+
+def live_answer_job(state, workspace_id, chat_id, message_ids):
+    from .jobs import latest_job
+
+    if state.get("workspace_id") != workspace_id or state.get("selected_chat_id") != chat_id:
+        return None
+    job = latest_job(workspace_id, chat_id)
+    if job is None:
+        return None
+    if job["status"] == "running" or not job["finalized"]:
+        return job
+    if job["final_message_id"] in message_ids or job["id"] in state.get("refreshed_jobs", set()):
+        return None
+    return job
+
+
+def mark_job_refreshed(state, job_id):
+    state.setdefault("refreshed_jobs", set()).add(job_id)

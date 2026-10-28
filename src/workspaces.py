@@ -14,6 +14,7 @@ else:
     import config
 
 _STORAGE = ContextVar("workspace_storage", default=None)
+_DATABASE_IDENTITY = ContextVar("workspace_database_identity", default=None)
 _ID = re.compile(r"[0-9a-f]{32}")
 
 
@@ -75,6 +76,30 @@ def storage_context(root, workspace_id=None):
         yield _STORAGE.get()
     finally:
         _STORAGE.reset(token)
+
+
+def database_identity(storage):
+    metadata = storage.db_path.stat()
+    return metadata.st_dev, metadata.st_ino
+
+
+@contextmanager
+def workspace_context(workspace_id, expected_database=None):
+    """Bind a validated existing workspace independently of a Streamlit session."""
+    storage = workspace_storage(workspace_id)
+    identity = database_identity(storage)
+    if expected_database is not None and identity != expected_database:
+        raise WorkspaceError("This workspace changed while the answer was running.")
+    with storage_context(storage.root, workspace_id):
+        token = _DATABASE_IDENTITY.set(identity)
+        try:
+            yield storage
+        finally:
+            _DATABASE_IDENTITY.reset(token)
+
+
+def bound_database_identity():
+    return _DATABASE_IDENTITY.get()
 
 
 def get_storage():

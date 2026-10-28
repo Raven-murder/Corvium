@@ -3,10 +3,12 @@ import re
 
 if __package__:
     from .config import CHAT_MODEL, get_client
+    from .generation import stream_completion
     from .ingest import search
     from .usage import reserve_workspace_action, UsageLimitError
 else:
     from config import CHAT_MODEL, get_client
+    from generation import stream_completion
     from ingest import search
     from usage import reserve_workspace_action, UsageLimitError
 
@@ -230,16 +232,20 @@ def _failure(language):
     return {"answer": FAILURE, "code": None, "language": language, "sources": []}
 
 
-def generate_diagram(question, kind, doc_ids=None):
+def generate_diagram(question, kind, doc_ids=None, *, on_chunk=None, check_cancel=None, on_sources=None, reset_partial=None, language=None):
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Enter a topic or question for the diagram.")
     kind = {"mindmap": "mind map", "flow chart": "flowchart"}.get(kind, kind)
     if kind not in {"flowchart", "mind map", "sequence"}:
         raise ValueError("Choose flowchart, mind map, or sequence.")
     reserve_workspace_action("tool")
-    language = diagram_language()
+    language = diagram_language() if language is None else language
     options = {} if doc_ids is None else {"source_doc_ids": doc_ids}
     passages = search(question, k=8, **options)
+    if check_cancel is not None:
+        check_cancel()
+    if on_sources is not None:
+        on_sources(passages)
     if not passages:
         return _failure(language)
     syntax = {
@@ -264,19 +270,27 @@ def generate_diagram(question, kind, doc_ids=None):
     prompt = f"Question: {question}\n\nNote passages:\n{context}"
     for attempt in range(2):
         try:
-            response = get_client().chat.completions.create(
-                model=CHAT_MODEL, messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=8000,
-            )
+            if check_cancel is not None:
+                check_cancel()
+            if attempt and reset_partial is not None:
+                reset_partial()
+            parameters = dict(model=CHAT_MODEL, messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=8000)
+            if on_chunk is not None:
+                content, finish_reason = stream_completion(get_client(), on_chunk=on_chunk, check_cancel=check_cancel, **parameters)
+            else:
+                response = get_client().chat.completions.create(**parameters)
+                choice = response.choices[0] if response.choices else None
+                content = choice.message.content if choice is not None else None
+                finish_reason = getattr(choice, "finish_reason", None)
         except UsageLimitError:
             raise
         except Exception:
             prompt += "\nCorrection: generation failed. Return complete valid diagram code with no more than 25 nodes."
             continue
         try:
-            choice = response.choices[0] if response.choices else None
-            if choice is None or getattr(choice, "finish_reason", None) == "length":
+            if not content or finish_reason == "length":
                 raise ValueError("Incomplete diagram response.")
-            code = sanitize_diagram(choice.message.content, language, kind)
+            code = sanitize_diagram(content, language, kind)
         except (ValueError, TypeError) as error:
             prompt += f"\nCorrection: {error} Return complete valid diagram code with no more than 25 nodes."
             continue

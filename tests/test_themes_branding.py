@@ -151,7 +151,7 @@ class BrandingTests(unittest.TestCase):
         ui.markdown.assert_called_with("**Test product**")
         logo = object()
         namespace["show_sidebar_header"](logo)
-        ui.image.assert_called_once_with(logo, width=28)
+        ui.image.assert_called_once_with(logo, width=40)
         main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
         prefix = main.body[:next(i for i, node in enumerate(main.body) if isinstance(node, ast.Try))]
         ui.session_state, ui.query_params = {}, {"w": "c" * 32}

@@ -8,7 +8,6 @@ from src.library import list_library, list_documents, group_images_by_type, reor
 from src.memory import list_memories
 from src.actions import study_plan_defaults, grade_quiz
 from src.plans import list_plans
-from src.qa import answer_question
 from src.diagrams import parse_diagram_message, presentation_code
 from src.sources import (
     group_answer_sources, original_download, open_sources_panel, active_sources_panel,
@@ -20,7 +19,6 @@ from src import search as doc_search
 from src import notes, themes
 from src.branding import load_logo, DEFAULT_ICON
 from src.workspaces import bind_workspace
-from src.usage import UsageLimitError
 
 
 def run_callback(action, *args):
@@ -153,23 +151,26 @@ def show_plan_view():
 
 
 def show_chat_message(message, chat_id, scope="chat"):
-    with st.chat_message(message["role"], width="stretch"):
-        if message.get("error"):
-            st.error(message["content"])
-        elif message.get("kind") == "quiz":
-            show_quiz_result(message, scope)
-        elif message.get("kind") == "plan":
-            st.markdown("**Study plan**")
-            st.markdown(message["content"])
-        elif message["role"] == "assistant":
-            show_answer(message["content"], f"{scope}_{chat_id}_message_{message['id']}")
-        else:
-            st.markdown(message["content"])
-        with st.container(horizontal=True, gap="small", key=f"message_actions_{scope}_{chat_id}_{message['id']}"):
+    user = message["role"] == "user"
+    with st.container(key=f"message_group_{message['role']}_{scope}_{chat_id}_{message['id']}"):
+        with st.chat_message(message["role"], width="content" if user else "stretch"):
+            if message.get("error"):
+                st.error(message["content"])
+            elif message.get("kind") == "quiz":
+                show_quiz_result(message, scope)
+            elif message.get("kind") == "plan":
+                st.markdown("**Study plan**")
+                st.markdown(message["content"])
+            elif message["role"] == "assistant":
+                show_answer(message["content"], f"{scope}_{chat_id}_message_{message['id']}")
+            else:
+                st.markdown(message["content"])
+        with st.container(horizontal=True, wrap=False, horizontal_alignment="right" if user else "left", gap="small",
+                          key=f"message_actions_{scope}_{chat_id}_{message['id']}"):
             show_message_pin(message, scope)
             if message["role"] == "assistant":
                 st.button(
-                    "", icon=":material/note_add:", help="Save to notes", type="tertiary",
+                    "", icon=":material/note_add:", help="Save to notes", type="tertiary", width="content",
                     key=f"save_note_{scope}_{chat_id}_{message['id']}", on_click=run_callback,
                     args=(flow.save_answer_to_notes, chat_id, message["id"]),
                 )
@@ -179,11 +180,38 @@ def show_chat_message(message, chat_id, scope="chat"):
             st.caption("Saved to notes.")
 
 
+@st.fragment(run_every=0.5)
+def show_live_answer(workspace_id, chat_id, message_ids):
+    if st.query_params.get("w") != workspace_id:
+        return
+    job = flow.live_answer_job(st.session_state, workspace_id, chat_id, message_ids)
+    if job is None:
+        return
+    if job["status"] != "running" and job["finalized"]:
+        flow.mark_job_refreshed(st.session_state, job["id"])
+        if job["final_message_id"] is None:
+            st.session_state.chat_notice = job["error_message"] or "The answer could not be saved. Please try again."
+        st.rerun()
+    with st.chat_message("assistant", width="stretch"):
+        if job["partial_text"]:
+            if job["kind"] == "diagram":
+                st.code(job["partial_text"], language=job["language"])
+            else:
+                st.markdown(job["partial_text"])
+        else:
+            st.caption("Preparing your answer…")
+        if job["status"] == "running":
+            st.button("Stop", icon=":material/stop:", key=f"stop_job_{job['id']}", disabled=job["cancel_requested"],
+                      on_click=run_callback, args=(flow.stop_answer_job, chat_id, job["id"]))
+        else:
+            st.caption("Saving answer…")
+
+
 def show_message_pin(message, scope="chat"):
     pinned = bool(message.get("pinned"))
     marker = "on" if pinned else "off"
     st.button(
-        "", icon=":material/push_pin:", help="Unpin message" if pinned else "Pin message", type="tertiary",
+        "", icon=":material/push_pin:", help="Unpin message" if pinned else "Pin message", type="tertiary", width="content",
         key=f"pin_{marker}_{scope}_message_{message['chat_id']}_{message['id']}",
         on_click=run_callback, args=(flow.pin_message_from_view, message["chat_id"], message["id"], not pinned),
     )
@@ -490,7 +518,7 @@ def show_sources(sources, answer, message_key):
     if not group_answer_sources(sources, answer):
         return
     st.button(
-        "Sources", icon=":material/menu_book:", type="tertiary", key=f"answer_sources_{message_key}",
+        "Sources", icon=":material/menu_book:", type="tertiary", width="content", key=f"answer_sources_{message_key}",
         on_click=run_callback, args=(open_sources_panel, sources, answer, message_key),
     )
 
@@ -675,7 +703,7 @@ def show_library_panel(library):
 def show_sidebar_header(logo):
     with st.container(horizontal=True, vertical_alignment="center", gap="small", key="brand_header"):
         if logo is not None:
-            st.image(logo, width=28)
+            st.image(logo, width=40)
         st.markdown(f"**{APP_NAME}**")
 
 
@@ -792,10 +820,14 @@ def main():
     pending = pending or starter_tool
     if pending:
         try:
-            with st.spinner({"plan": "Generating study plan…", "quiz": "Generating quiz…", "diagram": "Generating diagram…"}[pending[0]]):
-                flow.run_tool(st.session_state, *pending)
+            if pending[0] == "diagram":
+                flow.submit_answer_job(st.session_state, pending[1]["question"], pending[1])
+                st.rerun()
+            else:
+                with st.spinner({"plan": "Generating study plan…", "quiz": "Generating quiz…"}[pending[0]]):
+                    flow.run_tool(st.session_state, *pending)
         except Exception as error:
-            st.error(safe_error(error))
+            st.warning(safe_error(error))
     regenerate_id = st.session_state.pop("regenerate_plan_id", None)
     if regenerate_id is not None:
         try:
@@ -815,24 +847,19 @@ def main():
         st.error(safe_error(error))
         st.stop()
     question = st.chat_input("Ask about your notes", key="chat_prompt", disabled=not documents) or starter_question
-    if not messages and not question:
+    if question:
+        try:
+            flow.submit_answer_job(st.session_state, question)
+        except Exception as error:
+            st.session_state.chat_notice = safe_error(error)
+        st.rerun()
+    if not messages:
         show_empty_chat()
     for message in messages:
         show_chat_message(message, chat_id)
-    if question:
-        with st.chat_message("user", width="stretch"):
-            st.markdown(question)
-        with st.chat_message("assistant", width="stretch"):
-            try:
-                with st.spinner("Preparing your answer…"):
-                    result = answer_question(question, chat_id=chat_id)
-                show_answer(result["answer"], f"chat_{chat_id}_new_{len(messages)}")
-                show_sources(result["sources"], result["answer"], f"chat_{chat_id}_new_{len(messages)}")
-            except UsageLimitError as error:
-                st.session_state.chat_notice = safe_error(error)
-            except Exception as error:
-                st.error(safe_error(error))
-        st.rerun()
+    message_ids = {message["id"] for message in messages}
+    if flow.live_answer_job(st.session_state, st.session_state["workspace_id"], chat_id, message_ids) is not None:
+        show_live_answer(st.session_state["workspace_id"], chat_id, message_ids)
     show_sources_panel()
     show_active_dialog()
 

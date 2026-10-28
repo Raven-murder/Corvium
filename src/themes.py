@@ -84,7 +84,7 @@ def styles(theme="raven", accent="indigo"):
     accent = accent if isinstance(accent, str) and accent in ACCENTS else "indigo"
     palette = PRESETS[theme]
     properties = {"--cv-" + name: value for name, value in palette.items()}
-    properties.update({"--cv-accent": ACCENTS[accent], "--cv-on-accent": accent_text(accent),
+    properties.update({"--cv-accent": ACCENTS[accent], "--cv-accent-outline": ACCENTS[accent] + "8C", "--cv-on-accent": accent_text(accent),
                        "--cv-accent-text": light_accent_text(accent) if theme == "light" else ACCENTS[accent],
                        "--cv-scheme": "light" if theme == "light" else "dark"})
     declarations = ";".join(f"{key}:{value}" for key, value in properties.items())
@@ -99,9 +99,14 @@ html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 [data-testid="stAppViewContainer"] {
     background:radial-gradient(ellipse at 55% 5%, color-mix(in srgb,var(--cv-accent) 6%,transparent), transparent 55%),var(--cv-bg);
 }
-[data-testid="stHeader"], [data-testid="stBottom"], [data-testid="stBottomBlockContainer"] {
-    background:var(--cv-bg); color:var(--cv-text);
+[data-testid="stHeader"], [data-testid="stHeader"] div,
+[data-testid="stBottom"], [data-testid="stBottomBlockContainer"],
+[data-testid="stBottom"] div:not([data-testid="stChatInput"]):not([data-testid="stChatInput"] *),
+[data-testid="stBottomBlockContainer"] div:not([data-testid="stChatInput"]):not([data-testid="stChatInput"] *) {
+    background:var(--cv-bg)!important; background-image:none!important; color:var(--cv-text);
 }
+[data-testid="stHeader"]::before, [data-testid="stHeader"]::after,
+[data-testid="stBottom"]::before, [data-testid="stBottom"]::after {background:var(--cv-bg)!important; background-image:none!important;}
 [data-testid="stSidebar"], [data-testid="stSidebarContent"] {background:var(--cv-surface); color:var(--cv-text);}
 .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
 [data-testid="stMarkdownContainer"], [data-testid="stText"], [data-testid="stWidgetLabel"],
@@ -191,12 +196,18 @@ input[type="radio"], input[type="checkbox"] {accent-color:var(--cv-accent);}
 [data-testid="stChatMessage"] {width:100%; padding:0; background:transparent; gap:0; border-radius:12px; color:var(--cv-text);}
 [data-testid^="stChatMessageAvatar"] {display:none;}
 [data-testid="stChatMessageContent"] {width:100%; min-width:0; margin:0; flex:1 1 100%;}
-[data-testid="stChatMessage"]:has([aria-label="Chat message from user"]) {justify-content:flex-end;}
-[data-testid="stChatMessageContent"][aria-label="Chat message from user"] {
-    width:fit-content; max-width:80%; flex:0 1 auto; margin-left:auto; padding:.85rem 1rem;
+[class*="st-key-message_group_user_"] [data-testid="stChatMessage"] {
+    width:fit-content!important; max-width:75%; flex:0 1 auto; margin-left:auto; padding:.85rem 1rem;
     background:color-mix(in srgb,var(--cv-accent) 12%,var(--cv-bg));
     border:1px solid color-mix(in srgb,var(--cv-accent) 18%,var(--cv-border)); border-radius:16px 16px 4px 16px;
 }
+[class*="st-key-message_group_user_"] [data-testid="stChatMessageContent"] {
+    width:auto!important; min-width:0; max-width:100%; flex:1 1 auto; margin:0; overflow-wrap:anywhere;
+}
+[class*="st-key-message_actions_"] {display:flex!important; flex-direction:row!important; flex-wrap:nowrap!important; gap:.4rem!important;}
+[class*="st-key-message_actions_"] > [data-testid="stElementContainer"] {width:fit-content!important; flex:0 0 auto!important;}
+[class*="st-key-message_actions_"] button {width:fit-content!important; min-width:1.8rem; padding:.1rem .3rem;}
+[class*="st-key-message_group_user_"] [class*="st-key-message_actions_"] {justify-content:flex-end!important;}
 [data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"]:has(table) {overflow-x:auto;}
 [data-testid="stChatMessageContent"] table {width:100%; table-layout:auto;}
 [class*="st-key-diagram_canvas_"] {width:100%; min-width:0; background:var(--cv-surface); border:1px solid var(--cv-border); border-radius:12px;}
@@ -234,9 +245,9 @@ input[type="radio"], input[type="checkbox"] {accent-color:var(--cv-accent);}
 .chat-subtitle {text-align:center; color:var(--cv-muted); margin:.6rem 0 1.5rem; font-size:.95rem;}
 .st-key-empty_chat button {border-radius:20px; border-color:var(--cv-border); background:var(--cv-surface); color:var(--cv-text);}
 .st-key-empty_chat button:hover {border-color:var(--cv-accent);}
-.st-key-brand_header {gap:.5rem; padding-block:0; min-height:28px; margin-bottom:.2rem;}
-.st-key-brand_header [data-testid="stMarkdownContainer"] p {margin:0;}
-.st-key-brand_header [data-testid="stImage"] {flex:0 0 28px; margin:0;}
+.st-key-brand_header {gap:.5rem; padding-block:0; min-height:40px; margin-bottom:.2rem;}
+.st-key-brand_header [data-testid="stMarkdownContainer"] p {margin:0; font-size:1.6rem; font-weight:700; letter-spacing:-.035em; line-height:1.2;}
+.st-key-brand_header [data-testid="stImage"] {flex:0 0 40px; margin:0;}
 .st-key-tips pre {font-size:.75rem; line-height:1.4;}
 [data-testid="stPopoverBody"] {border:0; padding:.5rem;}
 [data-testid="stPopoverBody"] button {border:0; padding:.15rem .35rem;}
@@ -246,4 +257,19 @@ input[type="radio"], input[type="checkbox"] {accent-color:var(--cv-accent);}
 .st-key-library_controls button {border:0; padding:.15rem .35rem;}
 .st-key-sidebar_footer {margin-top:auto; padding-top:1.5rem;}
 [data-testid="stSidebarUserContent"] > [data-testid="stVerticalBlock"] {min-height:calc(100dvh - 5rem);}
+[data-testid="stSidebar"] :is(button, [data-testid="stExpander"], summary, [data-testid="stExpanderDetails"],
+    [data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"], [data-testid="stNumberInputContainer"],
+    .react-aria-ComboBox > [role="group"], [data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div),
+[data-testid="stPopoverBody"], [data-testid="stPopoverBody"] :is(button, [data-testid="stTextInputRootElement"],
+    [data-testid="stTextAreaRootElement"], .react-aria-ComboBox > [role="group"], [data-baseweb="input"], [data-baseweb="select"] > div) {
+    outline:1px solid var(--cv-accent-outline)!important; outline-offset:-1px; border-color:var(--cv-accent-outline)!important;
+}
+[data-testid="stSidebar"] :is(button, [data-testid="stExpander"], summary, [data-testid="stExpanderDetails"],
+    [data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"], [data-testid="stNumberInputContainer"],
+    .react-aria-ComboBox > [role="group"], [data-baseweb="input"], [data-baseweb="select"] > div):is(:hover,:focus,:focus-within),
+[data-testid="stPopoverBody"]:is(:hover,:focus-within),
+[data-testid="stPopoverBody"] :is(button, [data-testid="stTextInputRootElement"], [data-testid="stTextAreaRootElement"],
+    .react-aria-ComboBox > [role="group"], [data-baseweb="input"], [data-baseweb="select"] > div):is(:hover,:focus,:focus-within) {
+    outline-color:var(--cv-accent)!important; border-color:var(--cv-accent)!important;
+}
 """

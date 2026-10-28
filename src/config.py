@@ -1,5 +1,8 @@
 """Shared Nebius configuration and project-relative storage paths."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 
@@ -14,6 +17,32 @@ load_dotenv(PROJECT_ROOT / ".env")
 EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
 CHAT_MODEL = os.getenv("NEBIUS_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 DATA_DIR = PROJECT_ROOT / "data"
+_CLIENT_CONTEXT = ContextVar("generation_client_context", default=None)
+
+
+@dataclass(frozen=True)
+class ClientSettings:
+    api_key: str | None = field(repr=False)
+    base_url: str
+
+
+def capture_client_settings():
+    return ClientSettings(get_api_key(), os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.us-central1.nebius.com/v1/"))
+
+
+@contextmanager
+def client_context(settings, check_cancel, remaining):
+    token = _CLIENT_CONTEXT.set((settings, check_cancel, remaining))
+    try:
+        yield
+    finally:
+        _CLIENT_CONTEXT.reset(token)
+
+
+def check_request():
+    context = _CLIENT_CONTEXT.get()
+    if context is not None:
+        context[1]()
 
 
 def _limit(name, default):
@@ -30,6 +59,9 @@ GLOBAL_API_ACTION_LIMIT = _limit("GLOBAL_API_ACTION_LIMIT", 3000)
 
 
 def get_api_key():
+    context = _CLIENT_CONTEXT.get()
+    if context is not None:
+        return context[0].api_key
     key = os.environ.get("NEBIUS_API_KEY")
     if key:
         return key
@@ -47,12 +79,18 @@ def get_client():
     key = get_api_key()
     if not key:
         raise RuntimeError("NEBIUS_API_KEY is missing from the environment and Streamlit secrets.")
+    context = _CLIENT_CONTEXT.get()
+    options = {}
+    if context is not None:
+        check_request()
+        options["timeout"] = max(0.1, min(30.0, context[2]()))
     client = OpenAI(
         api_key=key,
-        base_url=os.getenv(
+        base_url=context[0].base_url if context is not None else os.getenv(
             "NEBIUS_BASE_URL", "https://api.tokenfactory.us-central1.nebius.com/v1/"
         ),
         max_retries=0,
+        **options,
     )
     if __package__:
         from .usage import guard_api_call

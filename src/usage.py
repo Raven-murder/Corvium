@@ -51,6 +51,15 @@ def reserve_api_action(now=None):
 def guard_api_call(function):
     @wraps(function)
     def guarded(*args, **kwargs):
+        config.check_request()
         reserve_api_action()
-        return function(*args, **kwargs)
+        result = function(*args, **kwargs)
+        try:
+            config.check_request()
+        except BaseException:
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise
+        return result
     return guarded
