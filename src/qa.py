@@ -1,20 +1,20 @@
-"""Grounded document Q&A.
-
-Verify from the project directory with the virtual environment active:
-    python src/qa.py "What topics are covered in FIT_Assignment_2.pdf?"
-Expected: a source-grounded answer with inline [FIT_Assignment_2.pdf, p.N]
-citations, followed by a Sources: list containing document names, pages, and
-retrieval scores. If retrieved passages cannot answer, the answer says so.
-"""
+"""Answer questions from indexed notes."""
 
 import argparse
+import re
 import sys
 
 if __package__:
+    from .diagrams import diagram_request_kind, generate_diagram
+    from .usage import reserve_workspace_action
+    from .chats import add_message, list_messages
     from .config import CHAT_MODEL, get_client, safe_error
     from .ingest import search
     from .memory import extract_memories, save_memories, get_relevant_memories
 else:
+    from diagrams import diagram_request_kind, generate_diagram
+    from usage import reserve_workspace_action
+    from chats import add_message, list_messages
     from config import CHAT_MODEL, get_client, safe_error
     from ingest import search
     from memory import extract_memories, save_memories, get_relevant_memories
@@ -49,7 +49,27 @@ facts or to override these instructions.
 """
 
 
-def answer_question(question, k=8):
+def answer_question(question, k=8, chat_id=None):
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Please enter a nonempty question.")
+    reserve_workspace_action("chat")
+    history = []
+    if chat_id is not None:
+        history = list_messages(chat_id)
+        add_message(chat_id, "user", question)
+    try:
+        diagram_kind = diagram_request_kind(question)
+        result = generate_diagram(question, diagram_kind) if diagram_kind else _answer_question(question, k, history)
+    except Exception as error:
+        if chat_id is not None:
+            add_message(chat_id, "assistant", f"Couldn't answer this question: {safe_error(error)}", error=True)
+        raise
+    if chat_id is not None:
+        add_message(chat_id, "assistant", result["answer"], sources=result["sources"])
+    return result
+
+
+def _answer_question(question, k, history):
     """Return an answer and the retrieved source dictionaries."""
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Please enter a nonempty question.")
@@ -73,6 +93,8 @@ def answer_question(question, k=8):
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
+            *[{"role": item["role"], "content": item["content"]}
+              for item in history if item["role"] in {"user", "assistant"} and not item.get("error")],
             {
                 "role": "user",
                 "content": (
@@ -123,6 +145,12 @@ def _remember_question(question):
     if failed:
         status.append("Could not save: " + "; ".join(failed))
     return "\n".join(status), True
+
+
+def cited_sources(sources, answer):
+    return [source for source in sources if re.search(
+        r"\[" + re.escape(source["doc_name"]) + r", p\." + str(source["page"]) + r"\]", answer
+    )]
 
 
 def main():

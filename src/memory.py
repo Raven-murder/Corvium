@@ -85,7 +85,6 @@ def save_memories(items):
     saved = 0
     try:
         with connection:
-            # Serialize comparison + insertion to avoid duplicate concurrent writes.
             connection.execute("BEGIN IMMEDIATE")
             existing = [
                 embedding_from_blob(row["embedding"])
@@ -163,3 +162,53 @@ def get_relevant_memories(question, k=5):
          "score": float(scores[index])}
         for index in order[np.isfinite(scores[order])][:k]
     ]
+
+
+def _memory_text(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Memory text must not be empty.")
+    return text.strip()
+
+
+def add_memory(text, kind="fact"):
+    text = _memory_text(text)
+    if kind not in KINDS:
+        raise ValueError("Invalid memory kind.")
+    vector = embed_texts([text])[0]
+    init_db()
+    connection = connect()
+    try:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute("SELECT id FROM memories WHERE text = ? AND kind = ?", (text, kind)).fetchone()
+            if existing:
+                return existing["id"]
+            return connection.execute(
+                "INSERT INTO memories(text, kind, created_at, embedding) VALUES (?, ?, ?, ?)",
+                (text, kind, datetime.now(timezone.utc).isoformat(), embedding_to_blob(vector)),
+            ).lastrowid
+    finally:
+        connection.close()
+
+
+def update_memory_text(memory_id, text):
+    text = _memory_text(text)
+    init_db()
+    connection = connect()
+    try:
+        existing = connection.execute("SELECT text FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if existing is None:
+            raise ValueError("Memory does not exist.")
+        if existing["text"] == text:
+            return False
+        vector = embed_texts([text])[0]
+        with connection:
+            cursor = connection.execute(
+                "UPDATE memories SET text = ?, embedding = ? WHERE id = ?",
+                (text, embedding_to_blob(vector), memory_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Memory does not exist.")
+        return True
+    finally:
+        connection.close()

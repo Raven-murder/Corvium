@@ -3,3 +3,7 @@ openai
 python-dotenv
 numpy
 pypdf
+python-docx
+python-pptx
+Pillow
+pypdfium2
