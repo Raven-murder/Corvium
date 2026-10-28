@@ -170,9 +170,8 @@ class MemoryActionTests(unittest.TestCase):
         with patch.object(workflows, "generate_study_plan", return_value="Plan") as plan:
             workflows.run_tool(state, "plan", {"days": 2, "focus_topics": ["Atomicity"], "source_doc_ids": [1]})
             self.assertEqual(plan.call_args.kwargs["source_doc_ids"], [1])
-        self.assertEqual(state["active_tool"], "plan")
-        workflows.close_tool_result(state)
-        self.assertNotIn("active_tool", state)
+        self.assertEqual(state["view"], "chat")
+        self.assertEqual(chats.list_messages(state["selected_chat_id"])[-1]["kind"], "plan")
         groups = library.group_images_by_type([{"name": "a.jpeg"}, {"name": "b.png"}, {"name": "c.webp"}])
         self.assertEqual(list(groups), ["PNG", "JPG", "WEBP"])
 

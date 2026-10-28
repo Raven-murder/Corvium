@@ -117,15 +117,17 @@ def chunk_text(text, page=1, chunk_size=2500, overlap=300, section=None):
     return chunks
 
 
-def embed_texts(texts: list[str]):
-    """Embed in batches of 32 with three attempts per batch."""
+def embed_texts(texts: list[str], *, max_attempts=3):
+    """Embed batches of 32; callers may limit retries for interactive search."""
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("Embedding attempts must be positive.")
     if not texts:
         return np.empty((0, VECTOR_LENGTH), dtype=np.float32)
     client = get_client()
     vectors = []
     for start in range(0, len(texts), 32):
         batch = texts[start:start + 32]
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 response = client.embeddings.create(model=EMBED_MODEL, input=batch)
                 items = sorted(response.data, key=lambda item: item.index)
@@ -141,9 +143,9 @@ def embed_texts(texts: list[str]):
             except UsageLimitError:
                 raise
             except Exception as error:
-                if attempt == 2:
+                if attempt == max_attempts - 1:
                     raise RuntimeError(
-                        f"Embedding batch {start // 32 + 1} failed after 3 attempts: "
+                        f"Embedding batch {start // 32 + 1} failed after {max_attempts} attempts: "
                         f"{safe_error(error)}"
                     ) from None
                 time.sleep(2 ** attempt)
@@ -238,7 +240,7 @@ def ingest_files(paths):
     return results
 
 
-def search(query, k=5, source_doc_ids=None):
+def search(query, k=5, source_doc_ids=None, *, embedding_attempts=3):
     """Return top-k source passages ranked by brute-force cosine similarity."""
     if not query.strip():
         raise ValueError("Search query must not be empty.")
@@ -263,7 +265,7 @@ def search(query, k=5, source_doc_ids=None):
     vectors = np.stack([embedding_from_blob(row["embedding"]) for row in rows])
     if vectors.shape[1] != VECTOR_LENGTH or not np.isfinite(vectors).all():
         raise ValueError("Stored embeddings are invalid; re-ingest the documents.")
-    query_vector = embed_texts([query])[0]
+    query_vector = (embed_texts([query]) if embedding_attempts == 3 else embed_texts([query], max_attempts=embedding_attempts))[0]
     norms = np.linalg.norm(vectors, axis=1)
     scores = np.divide(
         vectors @ query_vector,

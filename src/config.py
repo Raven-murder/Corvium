@@ -8,7 +8,7 @@ from openai import OpenAI
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-APP_NAME = "Project Zero"
+APP_NAME = "Corvium"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"

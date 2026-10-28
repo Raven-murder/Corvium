@@ -60,6 +60,23 @@ def _migrate(connection):
         id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS plans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+        body_json TEXT NOT NULL, days INTEGER NOT NULL,
+        created_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL,
+        doc_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        locator TEXT NOT NULL, label TEXT NOT NULL, created_at TEXT NOT NULL
+    )""")
+    connection.execute("CREATE INDEX IF NOT EXISTS notes_doc_id ON notes(doc_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS bookmarks_doc_id ON bookmarks(doc_id)")
     for name, definition in (
         ("folder_id", "INTEGER REFERENCES folders(id) ON DELETE SET NULL"),
         ("position", "INTEGER"), ("display_name", "TEXT"),
@@ -71,6 +88,13 @@ def _migrate(connection):
     _add_column(connection, "messages", "chat_id", "INTEGER REFERENCES chats(id) ON DELETE CASCADE")
     _add_column(connection, "messages", "sources", "TEXT NOT NULL DEFAULT '[]'")
     _add_column(connection, "messages", "error", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(connection, "messages", "kind", "TEXT NOT NULL DEFAULT 'text'")
+    connection.execute("UPDATE messages SET kind = 'text' WHERE kind IS NULL OR kind = ''")
+    for table in ("chats", "messages"):
+        _add_column(connection, table, "pinned", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(connection, table, "pinned_at", "TEXT")
+        connection.execute(f"UPDATE {table} SET pinned = 0 WHERE pinned IS NULL")
+        connection.execute(f"UPDATE {table} SET pinned_at = created_at WHERE pinned != 0 AND pinned_at IS NULL")
     connection.execute("UPDATE documents SET display_name = name WHERE display_name IS NULL")
     rows = connection.execute("SELECT id, name FROM documents WHERE kind IS NULL").fetchall()
     connection.executemany("UPDATE documents SET kind = ? WHERE id = ?", [
@@ -112,16 +136,13 @@ def _migrate(connection):
         END""")
     connection.execute("CREATE INDEX IF NOT EXISTS documents_folder_position ON documents(folder_id, position)")
     connection.execute("CREATE INDEX IF NOT EXISTS messages_chat_id ON messages(chat_id, id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS messages_pinned_order ON messages(pinned, pinned_at, id)")
 
 
 def delete_document(name):
     """Delete a document and its chunks atomically via the foreign-key cascade."""
-    connection = connect()
-    try:
-        with connection:
-            connection.execute("DELETE FROM documents WHERE name = ?", (name,))
-    finally:
-        connection.close()
+    with database_session(write=True) as connection:
+        connection.execute("DELETE FROM documents WHERE name = ?", (name,))
 
 
 def init_db():

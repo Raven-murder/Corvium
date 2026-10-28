@@ -46,6 +46,7 @@ def group_answer_sources(sources, answer):
             if identity not in groups:
                 name = document["name"] if document else source["doc_name"]
                 groups[identity] = {
+                    "doc_id": document["id"] if document else None,
                     "key": hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:16],
                     "doc_name": document["display_name"] if document else source["doc_name"],
                     "name": name,
@@ -68,6 +69,7 @@ def group_answer_sources(sources, answer):
             group["passages"].append({
                 "page": source["page"],
                 "heading": _passage_heading(group["kind"], section, source["page"]),
+                "locator": {"page": source["page"], "section": section},
                 "text": passage_preview(source["text"]),
             })
     for group in groups.values():
@@ -90,3 +92,33 @@ def original_download(source_group):
         return None
     return {"data": data, "file_name": source_group["name"],
             "mime": mimetypes.guess_type(source_group["name"])[0] or "application/octet-stream"}
+
+
+def open_sources_panel(state, sources, answer, message_key):
+    state["sources_panel"] = {
+        "sources": sources, "answer": answer, "message_key": message_key,
+        "chat_id": state.get("selected_chat_id"),
+    }
+
+
+def active_sources_panel(state):
+    panel = state.get("sources_panel")
+    if panel and panel["chat_id"] != state.get("selected_chat_id"):
+        close_sources_panel(state)
+        return None
+    return panel
+
+
+def dock_sources_panel(state, side):
+    if side not in {"left", "right", "bottom"}:
+        raise ValueError("Choose left, right, or bottom for Sources.")
+    state["sources_dock"] = side
+
+
+def sources_panel_dock(state):
+    side = state.get("sources_dock", "right")
+    return side if side in {"left", "right", "bottom"} else "right"
+
+
+def close_sources_panel(state):
+    state.pop("sources_panel", None)

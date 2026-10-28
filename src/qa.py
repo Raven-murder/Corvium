@@ -5,14 +5,14 @@ import re
 import sys
 
 if __package__:
-    from .diagrams import diagram_request_kind, generate_diagram
+    from .diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
     from .usage import reserve_workspace_action
     from .chats import add_message, list_messages
     from .config import CHAT_MODEL, get_client, safe_error
     from .ingest import search
     from .memory import extract_memories, save_memories, get_relevant_memories
 else:
-    from diagrams import diagram_request_kind, generate_diagram
+    from diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
     from usage import reserve_workspace_action
     from chats import add_message, list_messages
     from config import CHAT_MODEL, get_client, safe_error
@@ -65,7 +65,8 @@ def answer_question(question, k=8, chat_id=None):
             add_message(chat_id, "assistant", f"Couldn't answer this question: {safe_error(error)}", error=True)
         raise
     if chat_id is not None:
-        add_message(chat_id, "assistant", result["answer"], sources=result["sources"])
+        kind = "diagram" if diagram_kind and parse_diagram_message(result["answer"]) else "text"
+        add_message(chat_id, "assistant", result["answer"], sources=result["sources"], kind=kind)
     return result
 
 

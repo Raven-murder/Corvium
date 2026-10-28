@@ -50,7 +50,7 @@ class DiagramSanitizerTests(unittest.TestCase):
     def test_caps_explicit_and_implicit_nodes_for_every_diagram_type(self):
         for count in (25, 26):
             examples = (
-                'flowchart TD\n' + '\n'.join(f'a{i}[Step {i}]' for i in range(count)),
+                'flowchart TD\n' + '\n'.join(f'a{i}[Step {i}]' for i in range(count)) + '\n' + '\n'.join(f'a{i} --> a{i + 1}' for i in range(count - 1)),
                 'flowchart TD\n' + ' --> '.join(f'a{i}' for i in range(count)),
                 'mindmap\n root[Transactions]\n' + '\n'.join(f'   a{i}[Step {i}]' for i in range(count - 1)),
                 'sequenceDiagram\n' + '\n'.join(f'a0->>a{i}: Update' for i in range(1, count)),
@@ -60,6 +60,35 @@ class DiagramSanitizerTests(unittest.TestCase):
                 with self.subTest(count=count, header=code.splitlines()[0]):
                     language = 'dot' if code.startswith('digraph') else 'mermaid'
                     self.assertEqual(diagrams.validate_diagram(code, language), count <= 25)
+
+    def test_preserves_all_edge_tokens_and_label_quotes(self):
+        for arrow in ('-->', '---', '-.->', '==>', '<-->'):
+            with self.subTest(arrow=arrow):
+                code = diagrams.sanitize_diagram(f'flowchart TD\n A["Start"] {arrow}|"Next"| B[Finish]')
+                self.assertIn(f'n1 {arrow}|Next| n2', code)
+                self.assertNotIn('"', code)
+                self.assertTrue(code.startswith('flowchart LR'))
+                self.assertEqual(diagrams.sanitize_diagram(code), code)
+
+    def test_flowcharts_require_edges_no_isolated_nodes_and_connected_groups(self):
+        invalid = (
+            ('flowchart TD\n A[Start]\n B[Finish]', 'no edges'),
+            ('flowchart TD\n A --> B\n C --> D', 'at least 3 edges'),
+            ('flowchart TD\n A --> B\n B --> A\n C[Isolated]', 'isolated nodes'),
+            ('flowchart TD\n A --> B\n B --> A\n C --> D\n D --> C', 'disconnected groups'),
+        )
+        for code, problem in invalid:
+            with self.subTest(problem=problem):
+                self.assertFalse(diagrams.validate_diagram(code))
+                with self.assertRaisesRegex(ValueError, problem):
+                    diagrams.sanitize_diagram(code)
+
+    def test_direction_uses_lr_only_up_to_five_nodes_without_removing_edges(self):
+        for count, direction in ((2, 'LR'), (5, 'LR'), (6, 'TD'), (7, 'TD'), (8, 'TD'), (25, 'TD')):
+            code = 'flowchart RL\n' + '\n'.join(f'A{i} --> A{i + 1}' for i in range(count - 1))
+            cleaned = diagrams.sanitize_diagram(code)
+            self.assertTrue(cleaned.startswith(f'flowchart {direction}'))
+            self.assertEqual(cleaned.count('-->'), count - 1)
 
     def test_rejects_bad_headers_wrong_kinds_and_unsupported_directives(self):
         for code in (
@@ -130,6 +159,29 @@ class DiagramGenerationTests(unittest.TestCase):
                 self.assertEqual(result['answer'], diagrams.FAILURE)
                 self.assertEqual(self.complete.call_count, 2)
 
+    def test_model_edges_survive_sanitization_and_generation_prompt_requires_them(self):
+        code = 'flowchart TD\n A["Begin"] -->|"Then"| B[Update]\n B --- C[Check]\n C -.-> D[Retry]\n D ==> E[Commit]'
+        self.complete.return_value = response(code)
+        result = diagrams.generate_diagram('Diagram transactions', 'flowchart')
+        for edge in ('n1 -->|Then| n2', 'n2 --- n3', 'n3 -.-> n4', 'n4 ==> n5'):
+            self.assertIn(edge, result['code'])
+        prompt = self.complete.call_args.kwargs['messages'][0]['content']
+        self.assertIn('one edge per line', prompt)
+        self.assertIn('same node IDs', prompt)
+        self.assertIn('A --> B\n B -->|Yes| C', prompt)
+        self.assertEqual(self.complete.call_count, 1)
+
+    def test_edgeless_model_output_retries_with_specific_problem(self):
+        self.complete.side_effect = [response('flowchart TD\n A[Begin]\n B[Commit]'), response(FLOWCHART)]
+        result = diagrams.generate_diagram('Diagram transactions', 'flowchart')
+        self.assertIsNotNone(result['code'])
+        self.assertEqual(self.complete.call_count, 2)
+        self.assertIn('Flowchart has no edges', self.complete.call_args.kwargs['messages'][1]['content'])
+        self.complete.reset_mock(side_effect=True)
+        self.complete.return_value = response('flowchart TD\n A[Begin]\n B[Commit]')
+        self.assertEqual(diagrams.generate_diagram('Diagram transactions', 'flowchart')['answer'], diagrams.FAILURE)
+        self.assertEqual(self.complete.call_count, 2)
+
     def test_no_passages_never_calls_generation_model(self):
         self.search.return_value = []
         result = diagrams.generate_diagram('Diagram transactions', 'flowchart', doc_ids=[])
@@ -189,16 +241,37 @@ class DiagramIntegrationTests(unittest.TestCase):
             history = chats.list_messages(chat_id)
             self.assertEqual([item['role'] for item in history], ['user', 'assistant'])
             self.assertEqual(history[-1]['sources'], [SOURCE])
+            self.assertEqual(history[-1]['kind'], 'diagram')
             self.assertEqual(diagrams.parse_diagram_message(history[-1]['content'])['code'], code)
 
     def test_diagram_tool_passes_parameters_and_saves_result(self):
-        state = {}
-        parameters = {'question': 'Transactions', 'kind': 'mind map', 'doc_ids': [3]}
-        with patch.object(workflows, 'generate_diagram', return_value={'answer': 'Result'}) as generate:
-            workflows.run_tool(state, 'diagram', parameters)
-            generate.assert_called_once_with(**parameters)
-        self.assertEqual(state['active_tool'], 'diagram')
-        self.assertEqual(state['diagram_result'], {'answer': 'Result'})
+        with tempfile.TemporaryDirectory() as root, workspaces.storage_context(Path(root)):
+            chat_id = chats.create_chat()
+            state = {'selected_chat_id': chat_id}
+            parameters = {'question': 'Transactions', 'kind': 'mind map', 'doc_ids': [3]}
+            code = diagrams.sanitize_diagram(FLOWCHART)
+            result = {'answer': f'```mermaid\n{code}\n```', 'code': code, 'sources': [SOURCE]}
+            with patch.object(workflows, 'generate_diagram', return_value=result) as generate:
+                workflows.run_tool(state, 'diagram', parameters)
+                generate.assert_called_once_with(**parameters)
+            message = chats.list_messages(chat_id)[0]
+            self.assertEqual(message['kind'], 'diagram')
+            self.assertEqual(message['content'], result['answer'])
+            self.assertEqual(state['view'], 'chat')
+
+    def test_enlarged_diagram_state_validates_content_and_clears_on_chat_change(self):
+        state = {'selected_chat_id': 7}
+        content = f'```mermaid\n{FLOWCHART}\n```\n\nFrom notes.'
+        workflows.open_diagram_view(state, content, 'chat_7_message_2')
+        self.assertEqual(workflows.active_diagram_view(state)['message_key'], 'chat_7_message_2')
+        workflows.close_diagram_view(state)
+        self.assertIsNone(workflows.active_diagram_view(state))
+        with self.assertRaises(ValueError):
+            workflows.open_diagram_view(state, 'Not a diagram', 'invalid')
+        workflows.open_diagram_view(state, content, 'chat_7_message_2')
+        state['selected_chat_id'] = 8
+        self.assertIsNone(workflows.active_diagram_view(state))
+        self.assertNotIn('diagram_view', state)
 
     def test_native_mermaid_capability_is_detected(self):
         import streamlit as st
@@ -209,15 +282,20 @@ class DiagramIntegrationTests(unittest.TestCase):
 
     def test_history_rendering_uses_native_charts_and_unique_view_code_keys(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))
-        node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == 'show_answer')
-        ui = Mock()
-        ui.expander.return_value.__enter__ = Mock()
-        ui.expander.return_value.__exit__ = Mock(return_value=False)
-        namespace = {'st': ui, 'parse_diagram_message': diagrams.parse_diagram_message}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), '<diagram-ui>', 'exec'), namespace)
+        nodes = [item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name in {'show_answer', 'show_diagram_chart'}]
+        from unittest.mock import MagicMock
+        ui = MagicMock()
+        ui.session_state = {"theme_preset": "raven", "accent_name": "indigo"}
+        namespace = {'st': ui, 'parse_diagram_message': diagrams.parse_diagram_message,
+                     'run_callback': Mock(), 'flow': workflows, 'presentation_code': diagrams.presentation_code}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<diagram-ui>', 'exec'), namespace)
         for message_key in ('chat_1_message_2', 'chat_1_message_4'):
             namespace['show_answer'](f'```mermaid\n{FLOWCHART}\n```\n\nFrom notes.', message_key)
         self.assertEqual(ui.mermaid_chart.call_count, 2)
+        self.assertTrue(all(call.kwargs['width'] == 'content' for call in ui.mermaid_chart.call_args_list))
+        self.assertEqual(ui.button.call_count, 2)
+        self.assertTrue(all(call.args[0] == 'Enlarge' for call in ui.button.call_args_list))
+        self.assertTrue(all(call.kwargs['args'][0] is workflows.open_diagram_view for call in ui.button.call_args_list))
         self.assertEqual(len(set(call.kwargs['key'] for call in ui.expander.call_args_list)), 2)
         self.assertTrue(all(call.args[0] == 'View code' for call in ui.expander.call_args_list))
         ui.code.assert_called_with(diagrams.sanitize_diagram(FLOWCHART), language='mermaid')

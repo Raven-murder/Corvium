@@ -2,10 +2,10 @@ import ast
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 with patch("dotenv.load_dotenv"):
-    from src import db, sources, workspaces
+    from src import db, sources, workspaces, viewer
 
 
 class SourceTests(unittest.TestCase):
@@ -98,44 +98,70 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(group["passages"][0]["heading"], "Transactions")
         self.assertIsNotNone(sources.original_download(group))
 
-    def test_popover_has_unique_message_keys_and_hides_missing_downloads(self):
+    def test_sources_buttons_open_one_docked_panel_and_hide_missing_downloads(self):
         source = self.document("notes.pdf", "Notes")
         missing = self.document("missing.md", "Missing")
         (self.folder / "files" / "missing.md").unlink()
         tree = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
-        node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "show_sources")
-
-        class UI:
-            def __init__(self):
-                self.elements = []
-            def __enter__(self): return self
-            def __exit__(self, *args): return False
-            def popover(self, label, **kwargs):
-                self.elements.append(("popover", label, kwargs))
-                return self
-            def expander(self, label, **kwargs):
-                self.elements.append(("expander", label, kwargs))
-                return self
-            def columns(self, widths): return [self] * len(widths)
-            def markdown(self, text): self.elements.append(("markdown", text, {}))
-            def text(self, text): self.elements.append(("text", text, {}))
-            def caption(self, text): self.elements.append(("caption", text, {}))
-            def download_button(self, label, **kwargs): self.elements.append(("download", label, kwargs))
-        ui = UI()
-        namespace = {"st": ui, "group_answer_sources": sources.group_answer_sources, "original_download": sources.original_download}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<sources-ui>", "exec"), namespace)
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in {"show_sources", "show_sources_panel", "show_source_groups"}]
+        ui = MagicMock()
+        ui.session_state = {"selected_chat_id": 1}
+        ui.columns.side_effect = lambda widths: [ui] * len(widths)
+        namespace = {"st": ui, "group_answer_sources": sources.group_answer_sources,
+                     "original_download": sources.original_download, "run_callback": Mock(),
+                     "open_sources_panel": sources.open_sources_panel, "active_sources_panel": sources.active_sources_panel,
+                     "sources_panel_dock": sources.sources_panel_dock, "dock_sources_panel": sources.dock_sources_panel,
+                     "close_sources_panel": sources.close_sources_panel, "doc_viewer": viewer}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<sources-ui>", "exec"), namespace)
         for message_key in ("chat_1_message_2", "chat_1_message_4"):
             namespace["show_sources"]([source, missing], "Answer [Notes, p.1] [Missing, p.1]", message_key)
-        popovers = [item for item in ui.elements if item[0] == "popover"]
-        self.assertEqual(len(popovers), 2)
-        self.assertTrue(all(item[1] == "Sources" and item[2]["width"] == "stretch" for item in popovers))
-        downloads = [item for item in ui.elements if item[0] == "download"]
-        self.assertEqual(len(downloads), 2)
-        self.assertTrue(all(item[2]["file_name"] == "notes.pdf" for item in downloads))
-        keys = [item[2]["key"] for item in ui.elements if "key" in item[2]]
+        buttons = list(ui.button.call_args_list)
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(all(call.args[0] == "Sources" for call in buttons))
+        action, *args = buttons[-1].kwargs['args']
+        action(ui.session_state, *args)
+        namespace["show_sources_panel"]()
+        ui.popover.assert_not_called()
+        self.assertEqual(ui.session_state['sources_panel']['message_key'], 'chat_1_message_4')
+        self.assertIn('sources_panel_right', [call.kwargs['key'] for call in ui.container.call_args_list])
+        self.assertEqual(ui.download_button.call_count, 1)
+        self.assertEqual(ui.download_button.call_args.kwargs['file_name'], 'notes.pdf')
+        self.assertEqual(ui.expander.call_count, 2)
+        self.assertTrue(all(call.args[0].startswith('• **') for call in ui.expander.call_args_list))
+        keys = [call.kwargs['key'] for call in ui.button.call_args_list + ui.expander.call_args_list]
         self.assertEqual(len(keys), len(set(keys)))
-        self.assertFalse(any("score" in item[1].lower() for item in ui.elements))
-        self.assertTrue(all(item[1].startswith("• **") for item in ui.elements if item[0] == "expander"))
+        self.assertFalse(any('score' in str(call.args[0]).lower() for call in ui.method_calls if call.args))
+        self.assertEqual({call.kwargs['key'] for call in ui.button.call_args_list[2:]},
+                         {'sources_dock_left', 'sources_dock_right', 'sources_dock_bottom', 'close_sources_panel',
+                          *[f"source_open_chat_1_message_4_{group['key']}_0" for group in sources.group_answer_sources(
+                              [source, missing], "Answer [Notes, p.1] [Missing, p.1]")]})
+
+    def test_panel_replaces_previous_message_and_remembers_dock_after_close(self):
+        state = {'selected_chat_id': 1}
+        sources.open_sources_panel(state, [{'doc_name': 'First'}], 'First answer', 'first')
+        sources.dock_sources_panel(state, 'left')
+        sources.open_sources_panel(state, [{'doc_name': 'Second'}], 'Second answer', 'second')
+        self.assertEqual(sources.active_sources_panel(state)['message_key'], 'second')
+        self.assertEqual(sources.sources_panel_dock(state), 'left')
+        sources.close_sources_panel(state)
+        self.assertIsNone(sources.active_sources_panel(state))
+        self.assertEqual(sources.sources_panel_dock(state), 'left')
+        for dock in ('bottom', 'right'):
+            sources.dock_sources_panel(state, dock)
+            self.assertEqual(sources.sources_panel_dock(state), dock)
+        with self.assertRaises(ValueError):
+            sources.dock_sources_panel(state, 'invalid')
+        self.assertEqual(sources.sources_panel_dock(state), 'right')
+        state['sources_dock'] = 'invalid'
+        self.assertEqual(sources.sources_panel_dock(state), 'right')
+
+    def test_panel_closes_when_active_chat_changes(self):
+        state = {'selected_chat_id': 1}
+        sources.open_sources_panel(state, [], 'Answer', 'first')
+        state['selected_chat_id'] = 2
+        self.assertIsNone(sources.active_sources_panel(state))
+        self.assertNotIn('sources_panel', state)
 
 
 if __name__ == "__main__":

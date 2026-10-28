@@ -57,6 +57,28 @@ def _register(nodes, node_id, label=None, shape="box"):
     return nodes[node_id]["id"]
 
 
+def _validate_flowchart_connections(nodes, edges):
+    if not edges:
+        raise ValueError("Flowchart has no edges. Connect every node using the same node IDs.")
+    if len(edges) < len(nodes) - 1:
+        raise ValueError(f"Flowchart needs at least {len(nodes) - 1} edges for {len(nodes)} nodes; found {len(edges)}.")
+    neighbors = {node["id"]: set() for node in nodes.values()}
+    for start, end, *_ in edges:
+        neighbors[start].add(end)
+        neighbors[end].add(start)
+    isolated = [node_id for node_id, node in nodes.items() if not neighbors[node["id"]]]
+    if isolated:
+        raise ValueError("Flowchart has isolated nodes: " + ", ".join(isolated) + ". Connect them with supported edges.")
+    reached, pending = set(), [next(iter(neighbors))]
+    while pending:
+        current = pending.pop()
+        if current not in reached:
+            reached.add(current)
+            pending.extend(neighbors[current] - reached)
+    if len(reached) != len(nodes):
+        raise ValueError("Flowchart has disconnected groups. Connect all nodes into one diagram.")
+
+
 def _flowchart(lines, header):
     match = re.fullmatch(r"(flowchart|graph)(?:\s+(TD|TB|BT|LR|RL))?", header)
     if not match:
@@ -90,7 +112,9 @@ def _flowchart(lines, header):
                 raise ValueError("Incomplete flowchart edge.")
     if not nodes:
         raise ValueError("Diagram has no nodes.")
-    result = [f"{match.group(1)} {match.group(2) or 'TD'}"]
+    _validate_flowchart_connections(nodes, edges)
+    direction = "LR" if len(nodes) <= 5 else "TD"
+    result = [f"{match.group(1)} {direction}"]
     for node in nodes.values():
         left, right = ("{", "}") if node["shape"] == "decision" else ("[", "]")
         result.append(f"    {node['id']}{left}{node['label']}{right}")
@@ -219,7 +243,14 @@ def generate_diagram(question, kind, doc_ids=None):
     if not passages:
         return _failure(language)
     syntax = {
-        "flowchart": "Start with flowchart TD. Define nodes as A[Label] or A{Decision}. Use A --> B or A -->|label| B edges.",
+        "flowchart": (
+            "Start with flowchart LR for 5 or fewer nodes, otherwise flowchart TD. "
+            "Define nodes as A[Label] or A{Decision}. Every node must connect to the rest of the diagram. "
+            "Include at least (number of nodes minus 1) edges, with one edge per line, reusing exactly the same node IDs. "
+            "Use -->, ---, -.->, or ==> edges; put edge labels between pipes, as in A -->|Yes| B. "
+            "Never return node declarations without edges. Syntax example only (use facts from notes instead):\n"
+            "flowchart LR\n A[Start]\n B{Ready?}\n C[Finish]\n A --> B\n B -->|Yes| C"
+        ),
         "mind map": "Start with mindmap. Use one root and indented children, one node per line. Use alphanumeric IDs with [Label].",
         "sequence": "Start with sequenceDiagram. Declare participant A as Label. Use A->>B: Message. Use only participants and messages, with no loops or notes.",
     }[kind] if language == "mermaid" else "Return a digraph Notes { ... } with alphanumeric node IDs, [label=...] attributes, and simple -> edges. Use no other attributes."
@@ -236,16 +267,38 @@ def generate_diagram(question, kind, doc_ids=None):
             response = get_client().chat.completions.create(
                 model=CHAT_MODEL, messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens=8000,
             )
+        except UsageLimitError:
+            raise
+        except Exception:
+            prompt += "\nCorrection: generation failed. Return complete valid diagram code with no more than 25 nodes."
+            continue
+        try:
             choice = response.choices[0] if response.choices else None
             if choice is None or getattr(choice, "finish_reason", None) == "length":
                 raise ValueError("Incomplete diagram response.")
             code = sanitize_diagram(choice.message.content, language, kind)
-        except UsageLimitError:
-            raise
-        except Exception:
-            prompt += "\nCorrection: return complete valid diagram code in the requested syntax, with no more than 25 nodes."
+        except (ValueError, TypeError) as error:
+            prompt += f"\nCorrection: {error} Return complete valid diagram code with no more than 25 nodes."
             continue
         citations = " ".join(dict.fromkeys(f"[{item['doc_name']}, p.{item['page']}]" for item in passages))
         caption = f"Diagram based on your note passages. {citations}"
         return {"answer": f"```{language}\n{code}\n```\n\n{caption}", "code": code, "language": language, "caption": caption, "sources": passages}
     return _failure(language)
+
+
+def presentation_code(diagram, theme="raven", accent="indigo"):
+    from .themes import ACCENTS, PRESETS, diagram_config
+
+    code = sanitize_diagram(diagram["code"], diagram["language"])
+    settings = diagram_config(theme, accent)
+    if diagram["language"] == "mermaid":
+        return "---\nconfig: " + json.dumps(settings) + "\n---\n" + code
+    palette = PRESETS.get(theme, PRESETS["raven"])
+    color = ACCENTS.get(accent, ACCENTS["indigo"])
+    count = len(re.findall(r"^\s+n\d+ \[label=", code, re.M))
+    attributes = (
+        f'\n    graph [bgcolor="{palette["surface"]}", rankdir={"LR" if count <= 5 else "TB"}];'
+        f'\n    node [style=filled, fillcolor="{palette["surface"]}", color="{color}", fontcolor="{palette["text"]}", fontsize=16];'
+        f'\n    edge [color="{palette["muted"]}", fontcolor="{palette["text"]}", fontsize=16];'
+    )
+    return code.replace("{", "{" + attributes, 1)
