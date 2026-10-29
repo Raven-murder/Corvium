@@ -1,10 +1,15 @@
+from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import Event, Lock, RLock, Thread
+import json
 import time
 from uuid import uuid4
 
 from . import config, perf
+from .actions import generate_quiz, generate_study_plan
 from .chats import add_message, get_message, list_messages
+from .db import database_session
+from .plans import create_plan, get_plan, pin_plan
 from .diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
 from .qa import answer_question
 from .usage import UsageLimitError
@@ -33,10 +38,13 @@ class _Job:
     workspace_id: str
     chat_id: int
     kind: str
-    user_message_id: int
+    user_message_id: int | None
     user_created_at: str
     database: tuple
     language: str
+    chat_created_at: str | None = None
+    regenerate_plan_id: int | None = None
+    final_plan_id: int | None = None
     status: str = "running"
     partial_text: str = ""
     final_message_id: int | None = None
@@ -58,7 +66,8 @@ class JobManager:
         self.workers = {}
         self.monitor = None
 
-    def start(self, workspace_id, chat_id, question, *, diagram_parameters=None, language="json"):
+    def start(self, workspace_id, chat_id, question, *, diagram_parameters=None, language="json",
+              tool_kind=None, tool_parameters=None, regenerate_plan_id=None):
         workspace_id = validate_workspace_id(workspace_id)
         if type(chat_id) is not int or chat_id < 1 or not isinstance(question, str) or not question.strip():
             raise ValueError("Enter a question in a valid chat.")
@@ -67,21 +76,41 @@ class JobManager:
         parameters = None if diagram_parameters is None else dict(diagram_parameters)
         if parameters is not None and parameters.get("doc_ids") is not None:
             parameters["doc_ids"] = list(parameters["doc_ids"])
+        if tool_kind is not None:
+            if tool_kind not in {"plan", "quiz"} or diagram_parameters is not None:
+                raise ValueError("Choose a supported study tool.")
+            parameters = deepcopy(tool_parameters or {})
         settings = config.capture_client_settings()
         with self.lock:
             worker = self.workers.get(workspace_id)
             if (worker is not None and worker.is_alive()) or any(
                 job.workspace_id == workspace_id and (job.status == "running" or not job.finalized) for job in self.jobs.values()
             ):
-                raise JobBusyError("An answer is already running or finishing in this workspace. Please wait or stop it before asking again.")
+                raise JobBusyError("A generation is already running or finishing in this workspace. Please wait or stop it before starting another.")
             with workspace_context(workspace_id) as storage:
-                history = list_messages(chat_id)
-                message_id = add_message(chat_id, "user", question)
-                message = get_message(chat_id, message_id)
+                chat_created_at = None
+                if tool_kind is None:
+                    history = list_messages(chat_id)
+                    message_id = add_message(chat_id, "user", question)
+                    message_created_at = get_message(chat_id, message_id)["created_at"]
+                else:
+                    with database_session() as connection:
+                        chat = connection.execute("SELECT created_at FROM chats WHERE id = ?", (chat_id,)).fetchone()
+                    if chat is None:
+                        raise ValueError("This chat is no longer available.")
+                    chat_created_at = chat["created_at"]
+                    history, message_id, message_created_at = [], None, ""
+                    if regenerate_plan_id is not None:
+                        if tool_kind != "plan":
+                            raise ValueError("Only study plans can be regenerated.")
+                        previous = get_plan(regenerate_plan_id)
+                        parameters = dict(previous["body"].get("parameters", {}))
+                        parameters["days"] = previous["days"]
                 identity = database_identity(storage)
             job = _Job(uuid4().hex, workspace_id, chat_id,
-                       "diagram" if diagram_parameters is not None or diagram_request_kind(question) else "answer",
-                       message_id, message["created_at"], identity, language)
+                       tool_kind or ("diagram" if diagram_parameters is not None or diagram_request_kind(question) else "answer"),
+                       message_id, message_created_at, identity, language,
+                       chat_created_at=chat_created_at, regenerate_plan_id=regenerate_plan_id)
             self.jobs[job.id] = job
             worker = Thread(target=perf.worker(self._run) if perf.ENABLED else self._run, args=(job, question, history, parameters, settings), daemon=True)
             self.workers[workspace_id] = worker
@@ -137,7 +166,9 @@ class JobManager:
                 callbacks = {"on_chunk": lambda text: self._append(job, text), "check_cancel": lambda: self._check(job),
                              "on_sources": lambda sources: self._sources(job, sources), "reset_partial": lambda: self._reset(job),
                              "language": job.language}
-                if parameters is None:
+                if job.kind in {"plan", "quiz"}:
+                    result = self._generate_tool(job, parameters)
+                elif parameters is None:
                     result = answer_question(question, history=history, **callbacks)
                 else:
                     result = generate_diagram(**parameters, **callbacks)
@@ -155,6 +186,20 @@ class JobManager:
         except Exception as error:
             message = str(error) if isinstance(error, (UsageLimitError, config.StorageError)) else "The answer could not be completed. Please try again."
             self._finish(job, "error", error=message)
+
+    def _generate_tool(self, job, parameters):
+        with database_session() as connection:
+            memories = [dict(row) for row in connection.execute(
+                "SELECT id, text, kind, created_at FROM memories ORDER BY id DESC"
+            )]
+        self._check(job)
+        if job.kind == "plan":
+            content = generate_study_plan(**{**parameters, "memories": memories})
+            if content.startswith("No documents are indexed."):
+                raise ValueError(content)
+        else:
+            content = json.dumps(generate_quiz(**{**parameters, "memories": memories}), ensure_ascii=False)
+        return {"answer": content, "sources": [], "parameters": parameters}
 
     def _finish(self, job, status, *, result=None, error=None):
         with job.finish_lock:
@@ -174,19 +219,36 @@ class JobManager:
                 content, sources = result["answer"], result["sources"]
                 if job.kind == "diagram" and parse_diagram_message(content):
                     kind = "diagram"
+                elif job.kind in {"plan", "quiz"}:
+                    kind = job.kind
             elif status == "cancelled":
-                content = partial.strip() or "Stopped before an answer was generated."
+                content = partial.strip() or ("Stopped before a result was generated." if job.kind in {"plan", "quiz"}
+                                             else "Stopped before an answer was generated.")
                 if partial.strip() and job.kind == "diagram":
                     kind = "diagram"
                 content += "\n\n*Stopped*"
             else:
                 content, sources = error, []
-            message_id = None
+            message_id = plan_id = None
             try:
                 with workspace_context(job.workspace_id, job.database):
-                    user = get_message(job.chat_id, job.user_message_id)
-                    if user["created_at"] != job.user_created_at or user["role"] != "user":
-                        raise ValueError("The original question is no longer available.")
+                    if job.user_message_id is not None:
+                        user = get_message(job.chat_id, job.user_message_id)
+                        if user["created_at"] != job.user_created_at or user["role"] != "user":
+                            raise ValueError("The original question is no longer available.")
+                    else:
+                        with database_session() as connection:
+                            chat = connection.execute("SELECT created_at FROM chats WHERE id = ?", (job.chat_id,)).fetchone()
+                        if chat is None or chat["created_at"] != job.chat_created_at:
+                            raise ValueError("The original chat is no longer available.")
+                    if status == "done" and kind == "plan":
+                        parameters = result["parameters"]
+                        days = parameters.get("days", 7)
+                        previous = get_plan(job.regenerate_plan_id) if job.regenerate_plan_id is not None else None
+                        title = previous["title"] if previous else f"Study plan ({days} days)"
+                        plan_id = create_plan(title, {"markdown": content, "parameters": parameters}, days)
+                        if previous and previous["pinned"]:
+                            pin_plan(plan_id)
                     message_id = add_message(job.chat_id, "assistant", content, sources=sources, kind=kind, error=status == "error")
             except Exception as error:
                 with self.lock:
@@ -195,6 +257,7 @@ class JobManager:
             finally:
                 with self.lock:
                     job.final_message_id = message_id
+                    job.final_plan_id = plan_id
                     if status == "done" and message_id is not None:
                         job.partial_text = content
                     job.finalized = True
@@ -225,7 +288,8 @@ class JobManager:
     def _snapshot(self, job):
         return {name: getattr(job, name) for name in (
             "id", "workspace_id", "chat_id", "kind", "status", "partial_text", "final_message_id",
-            "error_message", "created_at", "updated_at", "finished_at", "finalized", "language"
+            "error_message", "created_at", "updated_at", "finished_at", "finalized", "language",
+            "final_plan_id", "regenerate_plan_id"
         )} | {"cancel_requested": job.cancel_flag.is_set()}
 
     def latest(self, workspace_id, chat_id=None, *, running_only=False):
@@ -264,6 +328,11 @@ _MANAGER = JobManager()
 
 def start_job(workspace_id, chat_id, question, **parameters):
     return _MANAGER.start(workspace_id, chat_id, question, **parameters)
+
+
+def start_tool_job(workspace_id, chat_id, kind, parameters, *, regenerate_plan_id=None):
+    return _MANAGER.start(workspace_id, chat_id, "Generate a " + kind, tool_kind=kind,
+                          tool_parameters=parameters, regenerate_plan_id=regenerate_plan_id)
 
 
 def latest_job(workspace_id, chat_id):

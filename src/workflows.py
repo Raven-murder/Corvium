@@ -394,10 +394,14 @@ def open_plan_view(state):
 
 
 def initialize_plan_selection(state, plans):
+    completed = state.pop("completed_plan_selection", None)
     if not plans:
         state.pop("selected_plan_id", None)
         return
-    if state.get("selected_plan_id") not in {plan["id"] for plan in plans}:
+    ids = {plan["id"] for plan in plans}
+    if completed in ids:
+        state["selected_plan_id"] = completed
+    if state.get("selected_plan_id") not in ids:
         state["selected_plan_id"] = plans[0]["id"]
 
 
@@ -530,6 +534,21 @@ def submit_answer_job(state, question, diagram_parameters=None):
     return job
 
 
+def submit_tool_job(state, kind, parameters, regenerate_plan_id=None):
+    from .jobs import start_tool_job
+
+    chat_id = state.get("selected_chat_id")
+    if chat_id is None:
+        chat_id = initial_chat_id()
+        state["selected_chat_id"] = chat_id
+    job = start_tool_job(state["workspace_id"], chat_id, kind, parameters, regenerate_plan_id=regenerate_plan_id)
+    state["view"] = "plan" if regenerate_plan_id is not None else "chat"
+    if regenerate_plan_id is not None:
+        state.pop("rail_dialog", None)
+        state.pop("rail_request", None)
+    return job
+
+
 def stop_answer_job(state, chat_id, job_id):
     from .jobs import cancel_job
 
@@ -551,8 +570,10 @@ def live_answer_job(state, workspace_id, chat_id, message_ids):
     return job
 
 
-def mark_job_refreshed(state, job_id):
+def mark_job_refreshed(state, job_id, job=None):
     state.setdefault("refreshed_jobs", set()).add(job_id)
+    if job and job.get("regenerate_plan_id") is not None and job.get("final_plan_id") is not None and state.get("view") == "plan":
+        state["completed_plan_selection"] = job["final_plan_id"]
 
 
 def note_editor_keys(note_id):

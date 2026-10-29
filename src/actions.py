@@ -152,7 +152,7 @@ def _complete(system, prompt):
     return content
 
 
-def generate_study_plan(days=7, focus_topics=None, source_doc_ids=None):
+def generate_study_plan(days=7, focus_topics=None, source_doc_ids=None, *, memories=None):
     if type(days) is not int or days < 1:
         raise ValueError("Choose a positive number of study days.")
     if focus_topics is not None and (
@@ -164,7 +164,7 @@ def generate_study_plan(days=7, focus_topics=None, source_doc_ids=None):
     chunks = _sample_chunks() if source_doc_ids is None else _sample_chunks(source_doc_ids=source_doc_ids)
     if not chunks:
         return "No documents are indexed. Upload notes before generating a study plan."
-    memories = list_memories()
+    memories = list_memories() if memories is None else memories
     today = date.today()
     dates = [(today + timedelta(days=i)).isoformat() for i in range(days)]
     system = (
@@ -295,19 +295,20 @@ def _parse_quiz(content, n, chunks):
     return items
 
 
-def generate_quiz(n=5, topic=None, difficulty=None, source_doc_ids=None):
+def generate_quiz(n=5, topic=None, difficulty=None, source_doc_ids=None, *, memories=None):
     if not isinstance(n, int) or not 3 <= n <= 10:
         raise ValueError("Choose between 3 and 10 questions.")
     if difficulty is not None and difficulty not in {"easy", "medium", "hard"}:
         raise ValueError("Difficulty must be easy, medium, or hard.")
     reserve_workspace_action("tool")
+    memories = list_memories() if memories is None else memories
     ids = normalize_document_ids(source_doc_ids)
     search_options = {} if ids is None else {"source_doc_ids": ids}
     if topic and topic.strip():
         chunks = search(topic.strip(), k=12, **search_options)
     else:
         chunks = _sample_chunks() if ids is None else _sample_chunks(source_doc_ids=ids)
-        weak_topics = [item["text"] for item in list_memories() if item["kind"] == "weak_topic"]
+        weak_topics = [item["text"] for item in memories if item["kind"] == "weak_topic"]
         if weak_topics and chunks:
             preferred = search("; ".join(weak_topics), k=4, **search_options)
             combined = preferred + chunks
@@ -336,7 +337,7 @@ def generate_quiz(n=5, topic=None, difficulty=None, source_doc_ids=None):
     )
     prompt = (
         f"Generate exactly {n} questions. Requested topic: {topic or 'any covered topic'}.\n"
-        f"Student weak topics: {json.dumps([m['text'] for m in list_memories() if m['kind'] == 'weak_topic'])}\n"
+        f"Student weak topics: {json.dumps([m['text'] for m in memories if m['kind'] == 'weak_topic'])}\n"
         f"Note passages:\n{_context(chunks)}"
     )
     if difficulty is not None:

@@ -108,8 +108,10 @@ html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
 [data-testid="stMarkdownContainer"], [data-testid="stText"], [data-testid="stWidgetLabel"],
 [data-testid="stChatMessageContent"], [role="dialog"], [role="dialog"] label {color:var(--cv-text);}
-[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
+[data-testid="stText"], [data-testid="stText"] span {color:var(--cv-text)!important;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] :is(p,span,li),
 [data-testid="stMarkdownContainer"] small {color:var(--cv-muted)!important;}
+[data-testid="stCaptionContainer"] {opacity:1!important;}
 a {color:var(--cv-accent-text)!important;}
 button, [data-testid="stDownloadButton"] button {
     color:var(--cv-text)!important; background:var(--cv-surface)!important; border-color:var(--cv-border)!important; border-radius:10px;
@@ -151,7 +153,19 @@ input::placeholder, textarea::placeholder {color:var(--cv-muted)!important; opac
 }
 [role="option"]:hover, [role="option"][aria-selected="true"] {background:color-mix(in srgb,var(--cv-accent) 15%,var(--cv-surface))!important;}
 [data-testid="stExpander"] {border-color:var(--cv-border); border-radius:12px; background:transparent; color:var(--cv-text);}
-[data-testid="stExpander"] summary, [data-testid="stExpander"] summary p {color:var(--cv-text);}
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] details[open] > summary,
+[data-testid="stExpander"] summary:is(:hover,:focus,:focus-visible,:active) {
+    background:var(--cv-surface)!important; color:var(--cv-text)!important; opacity:1!important;
+}
+[data-testid="stExpander"] summary :is(p,span,[data-testid="stMarkdownContainer"]) {color:inherit!important;}
+[data-testid="stSidebar"] :is(.st-key-manage_chats,.st-key-pinned_messages,.st-key-tools,.st-key-library,
+    .st-key-document_search,.st-key-bookmarks,.st-key-memory,.st-key-tips,.st-key-appearance)
+    > [data-testid="stExpander"] > details > summary > span {justify-content:center;}
+[data-testid="stSidebar"] :is(.st-key-manage_chats,.st-key-pinned_messages,.st-key-tools,.st-key-library,
+    .st-key-document_search,.st-key-bookmarks,.st-key-memory,.st-key-tips,.st-key-appearance)
+    > [data-testid="stExpander"] > details > summary > span > div {width:auto; flex-grow:0;}
+
 [data-testid="stPopoverBody"], [role="dialog"], [data-testid="stDialog"] > div {
     background:var(--cv-surface)!important; color:var(--cv-text)!important; border-color:var(--cv-border)!important; border-radius:12px;
 }
