@@ -17,6 +17,7 @@ class StudyPlanTests(unittest.TestCase):
         chunks = [{"doc_name": "notes.pdf", "page": 1, "text": "Covered material."}]
         namespace = {
             "re": re, "json": json, "date": date, "timedelta": timedelta,
+            "reserve_workspace_action": lambda kind: None,
             "TONE": "test", "_sample_chunks": lambda: chunks,
             "list_memories": lambda: [], "_context": lambda value: "notes",
             "_deadline_countdown": lambda memories, today:

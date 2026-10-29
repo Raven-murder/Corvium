@@ -1,30 +1,16 @@
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-from openai import OpenAI
-
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+if __package__:
+    from .config import CHAT_MODEL, get_client, safe_error
+else:
+    from config import CHAT_MODEL, get_client, safe_error
 
 
 def print_error(error):
-    message = str(error)
-    key = os.environ.get("NEBIUS_API_KEY")
-    if key:
-        message = message.replace(key, "[REDACTED]")
-    print(f"{type(error).__name__}: {message}")
+    print(safe_error(error))
 
 
 def main():
     try:
-        client = OpenAI(
-            base_url=os.getenv(
-                "NEBIUS_BASE_URL",
-                "https://api.tokenfactory.us-central1.nebius.com/v1/",
-            ),
-            api_key=os.environ["NEBIUS_API_KEY"],
-        )
+        client = get_client()
     except Exception as error:
         print_error(error)
         return
@@ -40,7 +26,7 @@ def main():
 
     try:
         response = client.chat.completions.create(
-            model=os.getenv("NEBIUS_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+            model=CHAT_MODEL,
             messages=[{"role": "user", "content": "Say hello in one sentence."}],
             max_tokens=300,
         )

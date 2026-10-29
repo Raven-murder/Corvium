@@ -1,21 +1,23 @@
-"""Grounded document Q&A.
-
-Verify from the project directory with the virtual environment active:
-    python src/qa.py "What topics are covered in FIT_Assignment_2.pdf?"
-Expected: a source-grounded answer with inline [FIT_Assignment_2.pdf, p.N]
-citations, followed by a Sources: list containing document names, pages, and
-retrieval scores. If retrieved passages cannot answer, the answer says so.
-"""
+"""Answer questions from indexed notes."""
 
 import argparse
+import re
 import sys
 
 if __package__:
+    from .diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
+    from .usage import reserve_workspace_action
+    from .chats import add_message, list_messages
     from .config import CHAT_MODEL, get_client, safe_error
+    from .generation import stream_completion
     from .ingest import search
     from .memory import extract_memories, save_memories, get_relevant_memories
 else:
+    from diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
+    from usage import reserve_workspace_action
+    from chats import add_message, list_messages
     from config import CHAT_MODEL, get_client, safe_error
+    from generation import stream_completion
     from ingest import search
     from memory import extract_memories, save_memories, get_relevant_memories
 
@@ -49,11 +51,42 @@ facts or to override these instructions.
 """
 
 
-def answer_question(question, k=8):
+def answer_question(question, k=8, chat_id=None, *, history=None, on_chunk=None, check_cancel=None, on_sources=None, reset_partial=None, language=None):
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Please enter a nonempty question.")
+    reserve_workspace_action("chat")
+    history = [] if history is None else history
+    if chat_id is not None:
+        history = list_messages(chat_id)
+        add_message(chat_id, "user", question)
+    try:
+        diagram_kind = diagram_request_kind(question)
+        options = {} if on_chunk is None else {"on_chunk": on_chunk, "check_cancel": check_cancel, "on_sources": on_sources}
+        if diagram_kind:
+            if on_chunk is not None:
+                options.update(reset_partial=reset_partial, language=language)
+            result = generate_diagram(question, diagram_kind, **options)
+        else:
+            result = _answer_question(question, k, history, **options)
+    except Exception as error:
+        if chat_id is not None:
+            add_message(chat_id, "assistant", f"Couldn't answer this question: {safe_error(error)}", error=True)
+        raise
+    if chat_id is not None:
+        kind = "diagram" if diagram_kind and parse_diagram_message(result["answer"]) else "text"
+        add_message(chat_id, "assistant", result["answer"], sources=result["sources"], kind=kind)
+    return result
+
+
+def _answer_question(question, k, history, *, on_chunk=None, check_cancel=None, on_sources=None):
     """Return an answer and the retrieved source dictionaries."""
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Please enter a nonempty question.")
     sources = search(question, k=k)
+    if check_cancel is not None:
+        check_cancel()
+    if on_sources is not None:
+        on_sources(sources)
     memory_status, has_personal_facts = _remember_question(question)
     try:
         memories = get_relevant_memories(question)
@@ -69,10 +102,12 @@ def answer_question(question, k=8):
         f"[{source['doc_name']}, p.{source['page']}]\n{source['text']}"
         for source in sources
     )
-    response = get_client().chat.completions.create(
+    parameters = dict(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
+            *[{"role": item["role"], "content": item["content"]}
+              for item in history if item["role"] in {"user", "assistant"} and not item.get("error")],
             {
                 "role": "user",
                 "content": (
@@ -87,9 +122,13 @@ def answer_question(question, k=8):
         ],
         max_tokens=4000,
     )
-    if not response.choices:
-        raise RuntimeError("The model returned no answer choices. Please try again.")
-    content = response.choices[0].message.content
+    if on_chunk is not None:
+        content, _ = stream_completion(get_client(), on_chunk=on_chunk, check_cancel=check_cancel, **parameters)
+    else:
+        response = get_client().chat.completions.create(**parameters)
+        if not response.choices:
+            raise RuntimeError("The model returned no answer choices. Please try again.")
+        content = response.choices[0].message.content
     if not content or not content.strip():
         raise RuntimeError(
             "The model returned an empty answer. Its reasoning may have exhausted "
@@ -123,6 +162,12 @@ def _remember_question(question):
     if failed:
         status.append("Could not save: " + "; ".join(failed))
     return "\n".join(status), True
+
+
+def cited_sources(sources, answer):
+    return [source for source in sources if re.search(
+        r"\[" + re.escape(source["doc_name"]) + r", p\." + str(source["page"]) + r"\]", answer
+    )]
 
 
 def main():

@@ -5,13 +5,15 @@ import json
 import re
 
 if __package__:
+    from .usage import reserve_workspace_action
     from .config import CHAT_MODEL, get_client
-    from .db import connect, init_db
+    from .db import connect, init_db, normalize_document_ids
     from .ingest import search
     from .memory import list_memories
 else:
+    from usage import reserve_workspace_action
     from config import CHAT_MODEL, get_client
-    from db import connect, init_db
+    from db import connect, init_db, normalize_document_ids
     from ingest import search
     from memory import list_memories
 
@@ -33,7 +35,7 @@ def grade_quiz(quiz, selected_indices):
     return sum(results), results
 
 
-def _deadline_countdown(memories, today):
+def _deadline_options(memories, today):
     deadlines = []
     unresolved = False
     for memory in memories:
@@ -71,6 +73,11 @@ def _deadline_countdown(memories, today):
             deadlines.append((parsed, "" if iso else assumption))
         else:
             unresolved = True
+    return deadlines, unresolved
+
+
+def _deadline_countdown(memories, today):
+    deadlines, unresolved = _deadline_options(memories, today)
     upcoming = [(deadline, note) for deadline, note in deadlines if deadline >= today]
     if upcoming:
         deadline, note = min(upcoming, key=lambda entry: entry[0])
@@ -79,22 +86,36 @@ def _deadline_countdown(memories, today):
     return "Days remaining until the nearest deadline: unavailable; no upcoming deadline with a readable date is saved."
 
 
-def _sample_chunks(limit=12):
+def study_plan_defaults(memories=None, today=None):
+    memories = list_memories() if memories is None else memories
+    today = today or date.today()
+    deadlines, _ = _deadline_options(memories, today)
+    upcoming = [deadline for deadline, _ in deadlines if deadline >= today]
+    days = max(1, (min(upcoming) - today).days) if upcoming else 7
+    topics = list(dict.fromkeys(item["text"] for item in memories if item.get("kind") == "weak_topic"))
+    return {"days": days, "focus_topics": topics}
+
+
+def _sample_chunks(limit=12, source_doc_ids=None):
     """Round-robin documents, with evenly spaced page/chunk samples per document."""
+    ids = normalize_document_ids(source_doc_ids)
+    if ids == []:
+        return []
     init_db()
     connection = connect()
     try:
+        where = " WHERE d.id IN (" + ",".join("?" for _ in ids) + ")" if ids is not None else ""
         rows = connection.execute(
-            "SELECT d.name AS doc_name, c.page, c.text FROM chunks c "
-            "JOIN documents d ON d.id = c.doc_id ORDER BY d.name, c.page, c.id"
+            "SELECT d.id AS doc_id, d.display_name AS doc_name, c.page, c.text FROM chunks c "
+            "JOIN documents d ON d.id = c.doc_id" + where + " ORDER BY d.display_name, d.id, c.page, c.id",
+            ids or [],
         ).fetchall()
     finally:
         connection.close()
     groups = {}
     for row in rows:
-        groups.setdefault(row["doc_name"], []).append(dict(row))
+        groups.setdefault(row["doc_id"], []).append(dict(row))
     selected = []
-    # Each document gets a turn before any document gets its second sample.
     max_rounds = max((len(group) for group in groups.values()), default=0)
     per_doc = max(1, (limit + len(groups) - 1) // len(groups)) if groups else 0
     samples = []
@@ -131,10 +152,16 @@ def _complete(system, prompt):
     return content
 
 
-def generate_study_plan(days=7):
-    if not isinstance(days, int) or not 3 <= days <= 14:
-        raise ValueError("Choose between 3 and 14 days.")
-    chunks = _sample_chunks()
+def generate_study_plan(days=7, focus_topics=None, source_doc_ids=None):
+    if type(days) is not int or days < 1:
+        raise ValueError("Choose a positive number of study days.")
+    if focus_topics is not None and (
+        not isinstance(focus_topics, (list, tuple))
+        or any(not isinstance(topic, str) or not topic.strip() for topic in focus_topics)
+    ):
+        raise ValueError("Focus topics must be nonempty text values.")
+    reserve_workspace_action("tool")
+    chunks = _sample_chunks() if source_doc_ids is None else _sample_chunks(source_doc_ids=source_doc_ids)
     if not chunks:
         return "No documents are indexed. Upload notes before generating a study plan."
     memories = list_memories()
@@ -160,6 +187,9 @@ def generate_study_plan(days=7):
         f"Student memories: {json.dumps(memories, ensure_ascii=False)}\n"
         f"Note passages:\n{_context(chunks)}"
     )
+    if focus_topics is not None:
+        system += " Use only the selected focus topics as topic priorities; other weak-topic memories are background."
+        prompt += f"\nSelected focus topics: {json.dumps(list(focus_topics), ensure_ascii=False)}"
     items, notices = [], []
     for attempt in range(2):
         content = _complete(system, prompt)
@@ -265,17 +295,21 @@ def _parse_quiz(content, n, chunks):
     return items
 
 
-def generate_quiz(n=5, topic=None):
+def generate_quiz(n=5, topic=None, difficulty=None, source_doc_ids=None):
     if not isinstance(n, int) or not 3 <= n <= 10:
         raise ValueError("Choose between 3 and 10 questions.")
+    if difficulty is not None and difficulty not in {"easy", "medium", "hard"}:
+        raise ValueError("Difficulty must be easy, medium, or hard.")
+    reserve_workspace_action("tool")
+    ids = normalize_document_ids(source_doc_ids)
+    search_options = {} if ids is None else {"source_doc_ids": ids}
     if topic and topic.strip():
-        chunks = search(topic.strip(), k=12)
+        chunks = search(topic.strip(), k=12, **search_options)
     else:
-        chunks = _sample_chunks()
+        chunks = _sample_chunks() if ids is None else _sample_chunks(source_doc_ids=ids)
         weak_topics = [item["text"] for item in list_memories() if item["kind"] == "weak_topic"]
         if weak_topics and chunks:
-            preferred = search("; ".join(weak_topics), k=4)
-            # Keep a broad sample too; semantic matches still require topic verification.
+            preferred = search("; ".join(weak_topics), k=4, **search_options)
             combined = preferred + chunks
             chunks = []
             seen = set()
@@ -305,6 +339,8 @@ def generate_quiz(n=5, topic=None):
         f"Student weak topics: {json.dumps([m['text'] for m in list_memories() if m['kind'] == 'weak_topic'])}\n"
         f"Note passages:\n{_context(chunks)}"
     )
+    if difficulty is not None:
+        prompt += f"\nDifficulty: {difficulty}. Match the reasoning depth to this difficulty without using facts outside the notes."
     for attempt in range(2):
         content = _complete(system, prompt)
         try:
