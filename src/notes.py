@@ -1,11 +1,12 @@
 from datetime import datetime, timezone
+import re
 
 from .db import database_session
 
 MAX_NOTES = 500
 MAX_BOOKMARKS = 500
 MAX_TITLE = 120
-MAX_BODY = 20_000
+MAX_BODY = 100_000
 
 
 class NotesError(ValueError):
@@ -29,7 +30,7 @@ def _body(value):
     if not isinstance(value, str):
         raise NotesError("Enter note text.")
     if len(value) > MAX_BODY:
-        raise NotesError("Notes can contain at most 20,000 characters.")
+        raise NotesError("Notes can contain at most 100,000 characters.")
     return value
 
 
@@ -190,4 +191,49 @@ def save_answer_note(chat_id, message_id):
         raise NotesError("Only assistant answers can be saved with this control.")
     groups = group_answer_sources(message["sources"], message["content"])
     doc_id = next((group["doc_id"] for group in groups if group["doc_id"] is not None), None)
+    from .diagrams import parse_diagram_message, save_diagram, get_saved_diagram, diagram_token
+    spec = parse_diagram_message(message["content"])
+    if spec is not None:
+        saved = get_saved_diagram(save_diagram(spec))
+        return create_note(spec["title"][:50], diagram_token(saved), doc_id)
     return create_note(message["content"][:50], message["content"], doc_id)
+
+
+_DIAGRAM_TOKEN = re.compile(r"!\[([^\]\n]*)\]\(diagram:([1-9]\d{0,18})\)")
+
+
+def get_note(note_id):
+    with database_session() as connection:
+        return dict(_note(connection, note_id))
+
+
+def duplicate_note(note_id, title=None, body=None):
+    original = get_note(note_id)
+    title = original["title"] if title is None else _title(title)
+    body = original["body"] if body is None else _body(body)
+    return create_note(title[:113] + " (copy)", body, original["doc_id"])
+
+
+def append_diagram(body, diagram_id):
+    from .diagrams import get_saved_diagram, diagram_token
+    diagram = get_saved_diagram(diagram_id)
+    if diagram is None:
+        raise NotesError("This diagram is no longer available in this workspace.")
+    return _body(body.rstrip() + ("\n\n" if body.strip() else "") + diagram_token(diagram))
+
+
+def preview_parts(body):
+    from .diagrams import get_saved_diagram
+    _body(body)
+    parts, position, saved = [], 0, {}
+    for match in _DIAGRAM_TOKEN.finditer(body):
+        if match.start() > position:
+            parts.append({"kind": "markdown", "text": body[position:match.start()]})
+        diagram_id = int(match[2])
+        if diagram_id not in saved:
+            saved[diagram_id] = get_saved_diagram(diagram_id)
+        parts.append({"kind": "diagram", "diagram": saved[diagram_id], "title": match[1]})
+        position = match.end()
+    if position < len(body):
+        parts.append({"kind": "markdown", "text": body[position:]})
+    return parts

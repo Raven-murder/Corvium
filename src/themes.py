@@ -1,11 +1,21 @@
 PRESETS = {
-    "raven": {"bg": "#0A0B10", "surface": "#12141C", "border": "#232738", "text": "#E8EAF2", "muted": "#9AA1B5"},
-    "light": {"bg": "#F6F7FB", "surface": "#FFFFFF", "border": "#D9DCE8", "text": "#14161F", "muted": "#5B6178"},
-    "midnight": {"bg": "#0A1020", "surface": "#121A2E", "border": "#22304F", "text": "#E6ECFA", "muted": "#98A6C6"},
-    "eye_comfort": {"bg": "#1C1A17", "surface": "#25221E", "border": "#3A352E", "text": "#E3DCCB", "muted": "#A99F8C"},
+    "auto": {"bg": "#EEF0F6", "surface": "#FFFFFF", "surface2": "#FFFFFF", "border": "#C9CEE0", "text": "#14161F", "muted": "#5B6178"},
+    "light": {"bg": "#EEF0F6", "surface": "#FFFFFF", "surface2": "#FFFFFF", "border": "#C9CEE0", "text": "#14161F", "muted": "#5B6178"},
+    "dark": {"bg": "#0A0B10", "surface": "#12141C", "surface2": "#1B1F2E", "border": "#2A3046", "text": "#E8EAF2", "muted": "#9AA1B5"},
+    "eye_comfort": {"bg": "#1C1A17", "surface": "#25221E", "surface2": "#2F2B25", "border": "#433D33", "text": "#E3DCCB", "muted": "#A99F8C"},
 }
-ACCENTS = {"indigo": "#7C8CFF", "violet": "#A78BFA", "teal": "#2DD4BF", "cyan": "#38BDF8", "rose": "#F472B6", "amber": "#FBBF24"}
-THEME_LABELS = {"raven": "Raven", "light": "Light", "midnight": "Midnight", "eye_comfort": "Eye comfort"}
+ACCENTS = {"blue": "#4F7CFF", "violet": "#8B5CF6", "green": "#22C55E", "amber": "#F5A524", "red": "#EF4444", "slate": "#94A3B8"}
+THEME_LABELS = {"auto": "Auto", "light": "Light", "dark": "Dark", "eye_comfort": "Eye comfort"}
+_THEME_ALIASES = {"raven": "dark", "midnight": "dark"}
+_ACCENT_ALIASES = {"indigo": "blue", "cyan": "blue", "teal": "green", "rose": "red"}
+
+
+def _theme(value):
+    return _THEME_ALIASES.get(value, value) if isinstance(value, str) else None
+
+
+def _accent(value):
+    return _ACCENT_ALIASES.get(value, value) if isinstance(value, str) else None
 
 
 def _rgb(color):
@@ -24,71 +34,58 @@ def contrast(first, second):
 
 
 def accent_text(accent):
-    color = ACCENTS.get(accent, ACCENTS["indigo"])
+    color = ACCENTS.get(_accent(accent), ACCENTS["blue"])
     return max(("#000000", "#FFFFFF"), key=lambda text: contrast(color, text))
 
 
 def light_accent_text(accent):
-    color = ACCENTS.get(accent, ACCENTS["indigo"])
-    channels = _rgb(color)
-    for percent in range(100, -1, -1):
+    channels = _rgb(ACCENTS.get(_accent(accent), ACCENTS["blue"]))
+    for percent in range(99, -1, -1):
         darkened = "#" + "".join(f"{round(value * percent / 100):02X}" for value in channels)
-        if contrast(darkened, PRESETS["light"]["bg"]) >= 4.5:
+        if min(contrast(darkened, PRESETS["light"][surface]) for surface in ("bg", "surface")) >= 4.5:
             return darkened
     return "#000000"
 
 
 def initialize_appearance(state, query):
-    theme = query.get("t")
-    accent = query.get("a")
-    if not isinstance(theme, str) or theme not in PRESETS:
-        theme = state.get("theme_preset", "raven")
-    if not isinstance(accent, str) or accent not in ACCENTS:
-        accent = state.get("accent_name", "indigo")
-    theme = theme if isinstance(theme, str) and theme in PRESETS else "raven"
-    accent = accent if isinstance(accent, str) and accent in ACCENTS else "indigo"
+    theme = _theme(query.get("t", state.get("theme_preset", "auto")))
+    accent = _accent(query.get("a", state.get("accent_name", "blue")))
+    theme = theme if theme in PRESETS else "auto"
+    accent = accent if accent in ACCENTS else "blue"
     state["theme_preset"], state["accent_name"] = theme, accent
     query["t"], query["a"] = theme, accent
     return theme, accent
 
 
 def change_appearance(state, query):
-    theme, accent = state.get("theme_preset"), state.get("accent_name")
-    query["t"] = theme if isinstance(theme, str) and theme in PRESETS else "raven"
-    query["a"] = accent if isinstance(accent, str) and accent in ACCENTS else "indigo"
+    theme, accent = _theme(state.get("theme_preset")), _accent(state.get("accent_name"))
+    state["theme_preset"] = query["t"] = theme if theme in PRESETS else "auto"
+    state["accent_name"] = query["a"] = accent if accent in ACCENTS else "blue"
 
 
-def diagram_config(theme, accent):
-    theme = theme if isinstance(theme, str) and theme in PRESETS else "raven"
-    accent = accent if isinstance(accent, str) and accent in ACCENTS else "indigo"
+def _properties(theme, accent):
     palette = PRESETS[theme]
-    return {"theme": "neutral" if theme == "light" else "dark", "fontSize": 16,
-            "themeVariables": {"fontSize": "16px", "primaryColor": palette["surface"],
-                               "primaryTextColor": palette["text"], "primaryBorderColor": ACCENTS[accent],
-                               "secondaryColor": palette["surface"], "tertiaryColor": palette["surface"],
-                               "mainBkg": palette["surface"], "nodeBkg": palette["surface"], "nodeBorder": ACCENTS[accent],
-                               "secondaryTextColor": palette["text"], "tertiaryTextColor": palette["text"],
-                               "edgeLabelBackground": palette["surface"], "clusterBkg": palette["surface"],
-                               "actorBkg": palette["surface"], "actorBorder": ACCENTS[accent],
-                               "noteBkgColor": palette["surface"], "signalColor": palette["muted"],
-                               "lineColor": palette["muted"], "textColor": palette["text"],
-                               "actorTextColor": palette["text"], "signalTextColor": palette["text"],
-                               "noteTextColor": palette["text"], "labelTextColor": palette["text"],
-                               "background": palette["surface"]},
-            "flowchart": {"useMaxWidth": False}, "sequence": {"useMaxWidth": False},
-            "mindmap": {"useMaxWidth": False}}
-
-
-def styles(theme="raven", accent="indigo"):
-    theme = theme if isinstance(theme, str) and theme in PRESETS else "raven"
-    accent = accent if isinstance(accent, str) and accent in ACCENTS else "indigo"
-    palette = PRESETS[theme]
+    color = ACCENTS[accent]
+    red, green, blue = _rgb(color)
+    light = theme in {"auto", "light"}
     properties = {"--cv-" + name: value for name, value in palette.items()}
-    properties.update({"--cv-accent": ACCENTS[accent], "--cv-accent-outline": ACCENTS[accent] + "8C", "--cv-on-accent": accent_text(accent),
-                       "--cv-accent-text": light_accent_text(accent) if theme == "light" else ACCENTS[accent],
-                       "--cv-scheme": "light" if theme == "light" else "dark"})
-    declarations = ";".join(f"{key}:{value}" for key, value in properties.items())
-    return "<style>:root{" + declarations + ";}" + _CSS + "</style>"
+    properties.update({"--cv-accent": color, "--cv-accent-outline": f"rgba({red},{green},{blue},0.55)",
+                       "--cv-on-accent": accent_text(accent),
+                       "--cv-accent-text": light_accent_text(accent) if light else color,
+                       "--cv-scheme": "light" if light else "dark",
+                       "--cv-popup-gradient": f"linear-gradient(135deg,rgba({red},{green},{blue},0.06),rgba({red},{green},{blue},0) 65%)",
+                       "--cv-popup-shadow": "0 16px 48px rgba(20,22,31,0.20)" if light else "0 12px 36px rgba(0,0,0,0.30)"})
+    return ";".join(f"{key}:{value}" for key, value in properties.items())
+
+
+def styles(theme="auto", accent="blue"):
+    theme, accent = _theme(theme), _accent(accent)
+    theme = theme if theme in PRESETS else "auto"
+    accent = accent if accent in ACCENTS else "blue"
+    declarations = ":root{" + _properties(theme, accent) + ";}"
+    if theme == "auto":
+        declarations += "@media (prefers-color-scheme: dark){:root{" + _properties("dark", accent) + ";}}"
+    return "<style>" + declarations + _CSS + "</style>"
 
 
 _CSS = r"""
@@ -150,7 +147,7 @@ input::placeholder, textarea::placeholder {color:var(--cv-muted)!important; opac
 }
 [data-testid="stMultiSelect"] [data-tag] span {color:var(--cv-on-accent)!important;}
 [data-baseweb="popover"], [data-baseweb="menu"], [role="listbox"], [role="option"] {
-    background:var(--cv-surface)!important; color:var(--cv-text)!important; border-color:var(--cv-border)!important;
+    background:var(--cv-surface2)!important; color:var(--cv-text)!important; border-color:var(--cv-border)!important;
 }
 [role="option"]:hover, [role="option"][aria-selected="true"] {background:color-mix(in srgb,var(--cv-accent) 15%,var(--cv-surface))!important;}
 [data-testid="stExpander"] {border-color:var(--cv-border); border-radius:12px; background:transparent; color:var(--cv-text);}
@@ -197,12 +194,12 @@ input[type="radio"], input[type="checkbox"] {accent-color:var(--cv-accent);}
 [data-testid^="stChatMessageAvatar"] {display:none;}
 [data-testid="stChatMessageContent"] {width:100%; min-width:0; margin:0; flex:1 1 100%;}
 [class*="st-key-message_group_user_"] [data-testid="stChatMessage"] {
-    width:fit-content!important; max-width:75%; flex:0 1 auto; margin-left:auto; padding:.85rem 1rem;
+    width:fit-content!important; min-width:fit-content!important; max-width:75%; flex:0 1 auto; margin-left:auto; padding:.85rem 1rem;
     background:color-mix(in srgb,var(--cv-accent) 12%,var(--cv-bg));
     border:1px solid color-mix(in srgb,var(--cv-accent) 18%,var(--cv-border)); border-radius:16px 16px 4px 16px;
 }
 [class*="st-key-message_group_user_"] [data-testid="stChatMessageContent"] {
-    width:auto!important; min-width:0; max-width:100%; flex:1 1 auto; margin:0; overflow-wrap:anywhere;
+    width:auto!important; min-width:0; max-width:100%; flex:0 1 auto; margin:0; overflow-wrap:normal; word-break:normal; white-space:normal;
 }
 [class*="st-key-message_actions_"] {display:flex!important; flex-direction:row!important; flex-wrap:nowrap!important; gap:.4rem!important;}
 [class*="st-key-message_actions_"] > [data-testid="stElementContainer"] {width:fit-content!important; flex:0 0 auto!important;}
@@ -210,13 +207,16 @@ input[type="radio"], input[type="checkbox"] {accent-color:var(--cv-accent);}
 [class*="st-key-message_group_user_"] [class*="st-key-message_actions_"] {justify-content:flex-end!important;}
 [data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"]:has(table) {overflow-x:auto;}
 [data-testid="stChatMessageContent"] table {width:100%; table-layout:auto;}
-[class*="st-key-diagram_canvas_"] {width:100%; min-width:0; background:var(--cv-surface); border:1px solid var(--cv-border); border-radius:12px;}
-[class*="st-key-diagram_canvas_inline_"] {height:420px!important; max-height:420px; overflow:auto!important;}
-[class*="st-key-diagram_canvas_large_"] {min-height:480px; max-height:72dvh; overflow:auto!important;}
-[class*="st-key-diagram_canvas_"] [data-testid="stMermaidChart"] {width:max-content!important; min-width:100%; padding:.5rem; align-items:flex-start!important;}
-[class*="st-key-diagram_canvas_"] img, [class*="st-key-diagram_canvas_"] svg, [class*="st-key-diagram_canvas_"] canvas {
-    width:auto!important; max-width:none!important; height:auto!important; max-height:none!important; flex-shrink:0;
+[class*="st-key-diagram_canvas_"] {
+    width:100%; min-width:0; background:rgb(255 255 255)!important; color:rgb(17 24 39)!important;
+    border:1px solid rgb(201 206 224); border-radius:12px; padding:.75rem; overflow:auto!important;
 }
+[class*="st-key-diagram_canvas_inline_"] {max-height:480px!important; height:auto;}
+[class*="st-key-diagram_canvas_large_"] {max-height:72dvh; min-height:240px;}
+[class*="st-key-diagram_canvas_inline_"] [data-testid="stImage"],
+[class*="st-key-diagram_canvas_inline_"] img {width:100%!important; max-width:100%!important; height:auto!important;}
+[class*="st-key-diagram_canvas_large_"] [data-testid="stImage"],
+[class*="st-key-diagram_canvas_large_"] img {width:max-content!important; max-width:none!important; height:auto!important;}
 .stMain [class*="st-key-sources_panel_"] {
     position:fixed; top:5rem; right:1rem; width:380px; height:calc(100dvh - 13rem);
     min-width:280px; min-height:220px; max-width:calc(100vw - 2rem); max-height:calc(100dvh - 7rem);
@@ -272,4 +272,42 @@ input[type="radio"], input[type="checkbox"] {accent-color:var(--cv-accent);}
     .react-aria-ComboBox > [role="group"], [data-baseweb="input"], [data-baseweb="select"] > div):is(:hover,:focus,:focus-within) {
     outline-color:var(--cv-accent)!important; border-color:var(--cv-accent)!important;
 }
+
+[class*="st-key-message_group_user_"] {width:100%!important; min-width:0; align-items:stretch;}
+[class*="st-key-message_group_user_"] [data-testid="stChatMessageContent"] :is(p,li,span) {
+    white-space:normal!important; overflow-wrap:normal!important; word-break:normal!important;
+}
+[data-testid="stPopoverBody"], [role="dialog"], [data-testid="stDialog"] > div, [data-testid="stExpanderDetails"],
+.stMain [class*="st-key-sources_panel_"], .st-key-tools [data-testid="stForm"],
+.st-key-appearance [data-testid="stExpanderDetails"], [data-baseweb="popover"], [data-baseweb="menu"], [role="listbox"] {
+    background-color:var(--cv-surface2)!important; background-image:var(--cv-popup-gradient)!important;
+    color:var(--cv-text)!important; border:1px solid var(--cv-border); border-radius:12px; box-shadow:var(--cv-popup-shadow);
+}
+.st-key-sources_header {background:var(--cv-surface2)!important;}
+[data-testid="stPopoverBody"] {
+    z-index:1000005!important; box-sizing:border-box;
+    max-width:min(340px,calc(100vw - 2rem))!important; max-height:70vh!important; overflow-y:auto!important;
+    padding:.75rem; border:1px solid var(--cv-accent-outline)!important;
+}
+[data-testid="stPopoverBody"]::backdrop {background:transparent;}
+[data-baseweb="popover"]:has([data-testid="stPopoverBody"]),
+[role="dialog"]:has(> [data-testid="stPopoverBody"]),
+.react-aria-Popover:has([data-testid="stPopoverBody"]),
+[data-rac][data-placement]:has([data-testid="stPopoverBody"]) {z-index:1000005!important;}
+[data-testid="stSidebar"] [data-testid="stExpanderDetails"] {border:1px solid var(--cv-accent-outline)!important;}
+[data-testid="stSidebar"] [data-testid="stExpanderDetails"]:is(:hover,:focus-within) {border-color:var(--cv-accent)!important;}
+
+.st-key-rail {
+    position:fixed!important; left:0; top:0; bottom:0; width:52px!important; height:100dvh; padding:3.5rem 5px 1rem;
+    display:flex; flex-direction:column; gap:.35rem; overflow-y:auto; z-index:999900;
+    background:var(--cv-surface); border-right:1px solid var(--cv-border); box-sizing:border-box;
+}
+.st-key-rail button {width:40px!important; min-height:38px; padding:.35rem!important; border:0!important;}
+.st-key-rail button:hover {background:color-mix(in srgb,var(--cv-accent) 12%,var(--cv-surface))!important;}
+body:has([data-testid="stSidebar"][aria-expanded="true"]) .st-key-rail {display:none!important;}
+body:not(:has([data-testid="stSidebar"][aria-expanded="true"])) [data-testid="stMainBlockContainer"],
+body:not(:has([data-testid="stSidebar"][aria-expanded="true"])) [data-testid="stBottomBlockContainer"] {padding-left:calc(1.5rem + 52px);}
+.st-key-rail_bridge_host {display:none!important; height:0!important; min-height:0!important;}
+[class*="st-key-notes_row_"] button {padding:.2rem .3rem; min-width:1.6rem;}
+[class*="st-key-notes_row_"] {align-items:center; gap:.2rem!important;}
 """

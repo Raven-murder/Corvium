@@ -18,7 +18,7 @@ def _load_image(path, version):
         return None
 
 
-def load_logo(theme="raven", assets_dir=None):
+def load_logo(theme="auto", assets_dir=None):
     directory = Path(assets_dir) if assets_dir is not None else PROJECT_ROOT / "assets"
     names = ("raven_light.png", "raven.png") if theme == "light" else ("raven.png",)
     for name in names:

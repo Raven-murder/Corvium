@@ -171,6 +171,8 @@ def _remember_question(question):
 
 
 def cited_sources(sources, answer):
+    if parse_diagram_message(answer) is not None:
+        return sources
     return [source for source in sources if re.search(
         r"\[" + re.escape(source["doc_name"]) + r", p\." + str(source["page"]) + r"\]", answer
     )]

@@ -56,11 +56,11 @@ class JobManager:
         self.workers = {}
         self.monitor = None
 
-    def start(self, workspace_id, chat_id, question, *, diagram_parameters=None, language="mermaid"):
+    def start(self, workspace_id, chat_id, question, *, diagram_parameters=None, language="json"):
         workspace_id = validate_workspace_id(workspace_id)
         if type(chat_id) is not int or chat_id < 1 or not isinstance(question, str) or not question.strip():
             raise ValueError("Enter a question in a valid chat.")
-        if language not in {"mermaid", "dot"}:
+        if language != "json":
             raise ValueError("Choose a supported diagram format.")
         parameters = None if diagram_parameters is None else dict(diagram_parameters)
         if parameters is not None and parameters.get("doc_ids") is not None:
@@ -175,7 +175,7 @@ class JobManager:
             elif status == "cancelled":
                 content = partial.strip() or "Stopped before an answer was generated."
                 if partial.strip() and job.kind == "diagram":
-                    content = f"```{job.language}\n{content}\n```"
+                    kind = "diagram"
                 content += "\n\n*Stopped*"
             else:
                 content, sources = error, []

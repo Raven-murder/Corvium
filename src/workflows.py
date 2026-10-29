@@ -8,7 +8,7 @@ from .db import init_db, delete_document
 from .chats import create_chat, list_chats, rename_chat, delete_chat, initial_chat_id, add_message, list_messages, get_message, most_recent_chat_id, set_chat_pinned, set_message_pinned
 from .library import create_folder, rename_folder, delete_folder, list_documents, rename_document, move_document
 from .memory import add_memory, update_memory_text, delete_memory, clear_memories
-from .diagrams import generate_diagram, parse_diagram_message
+from .diagrams import generate_diagram, parse_diagram_message, diagram_caption
 from .actions import generate_study_plan, generate_quiz, grade_quiz
 from .plans import create_plan, list_plans, get_plan, rename_plan, pin_plan, delete_plan
 from . import notes
@@ -215,7 +215,7 @@ def run_tool(state, kind, parameters):
     else:
         result = generate_diagram(**parameters)
         content, sources = result["answer"], result["sources"]
-        if not result.get("code"):
+        if not result.get("spec"):
             message_kind = "text"
     message_id = add_message(chat_id, "assistant", content, sources=sources, kind=message_kind)
     state["view"] = "chat"
@@ -278,7 +278,7 @@ def check_quiz_answers(state, message_id, chat_id=None):
 
 def new_chat(state):
     state["selected_chat_id"] = create_chat()
-    state["view"] = "chat"
+    open_chat_view(state)
 
 
 def edit_document(state, document_id, display_name, folder_id):
@@ -319,6 +319,9 @@ def confirm_destructive_action(state, token):
         result = reset_demo_from_sidebar(state)
     elif kind == "note":
         notes.delete_note(item)
+        state.get("note_drafts", {}).pop(item, None)
+        if state.get("selected_note_id") == item:
+            state.pop("selected_note_id", None)
         result = True
     elif kind == "bookmark":
         notes.delete_bookmark(item)
@@ -353,11 +356,11 @@ def consume_starter(state):
     return None, None
 
 
-def open_diagram_view(state, content, message_key):
+def open_diagram_view(state, content, message_key, sources=()):
     diagram = parse_diagram_message(content)
     if diagram is None:
         raise ValueError("This message does not contain a valid diagram.")
-    state["diagram_view"] = {**diagram, "message_key": message_key, "chat_id": state.get("selected_chat_id")}
+    state["diagram_view"] = {"spec": diagram, "caption": diagram_caption(diagram, sources), "message_key": message_key, "chat_id": state.get("selected_chat_id")}
 
 
 def active_diagram_view(state):
@@ -374,10 +377,14 @@ def close_diagram_view(state):
 
 def open_chat_view(state):
     state["view"] = "chat"
+    state.pop("rail_dialog", None)
+    state.pop("rail_request", None)
 
 
 def open_plan_view(state):
     state["view"] = "plan"
+    state.pop("rail_dialog", None)
+    state.pop("rail_request", None)
     plans = list_plans()
     if plans:
         state["selected_plan_id"] = plans[0]["id"]
@@ -494,8 +501,9 @@ def pin_note_from_sidebar(state, note_id, pinned):
 
 
 def save_answer_to_notes(state, chat_id, message_id):
-    notes.save_answer_note(chat_id, message_id)
+    note_id = notes.save_answer_note(chat_id, message_id)
     state["note_saved_message"] = (chat_id, message_id)
+    open_notes_view(state, note_id)
 
 
 def rename_bookmark_from_input(state, bookmark_id, key):
@@ -544,3 +552,80 @@ def live_answer_job(state, workspace_id, chat_id, message_ids):
 
 def mark_job_refreshed(state, job_id):
     state.setdefault("refreshed_jobs", set()).add(job_id)
+
+
+def note_editor_keys(note_id):
+    return f"notes_title_{note_id}", f"notes_body_{note_id}"
+
+
+def select_note(state, note_id):
+    note = notes.get_note(note_id)
+    drafts = state.setdefault("note_drafts", {})
+    draft = drafts.setdefault(note_id, {"title": note["title"], "body": note["body"]})
+    title_key, body_key = note_editor_keys(note_id)
+    state.setdefault(title_key, draft["title"])
+    state.setdefault(body_key, draft["body"])
+    state["selected_note_id"] = note_id
+    return note
+
+
+def open_notes_view(state, note_id=None):
+    state["view"] = "notes"
+    for key in ("rail_dialog", "rail_request", "pinned_message_view", "viewer_request", "diagram_view", "sources_panel"):
+        state.pop(key, None)
+    if note_id is not None:
+        select_note(state, note_id)
+        state["notes_view_filter"] = ""
+
+
+def initialize_notes_selection(state, items):
+    ids = {item["id"] for item in items}
+    if state.get("selected_note_id") not in ids:
+        state.pop("selected_note_id", None)
+        if items:
+            select_note(state, items[0]["id"])
+    elif items:
+        select_note(state, state["selected_note_id"])
+
+
+def capture_note_draft(state, note_id):
+    title_key, body_key = note_editor_keys(note_id)
+    state.setdefault("note_drafts", {})[note_id] = {"title": state.get(title_key, ""), "body": state.get(body_key, "")}
+
+
+def new_note(state):
+    open_notes_view(state, notes.create_note("Untitled note", ""))
+
+
+def save_note_editor(state, note_id):
+    capture_note_draft(state, note_id)
+    draft = state["note_drafts"][note_id]
+    notes.update_note(note_id, draft["title"], draft["body"])
+    state["notes_notice"] = "Note saved."
+
+
+def duplicate_note_editor(state, note_id):
+    capture_note_draft(state, note_id)
+    draft = state["note_drafts"][note_id]
+    open_notes_view(state, notes.duplicate_note(note_id, draft["title"], draft["body"]))
+
+
+def insert_note_diagram(state, note_id, widget_key):
+    _, body_key = note_editor_keys(note_id)
+    state[body_key] = notes.append_diagram(state.get(body_key, ""), state.get(widget_key))
+    capture_note_draft(state, note_id)
+
+
+def save_diagram_from_message(state, chat_id, message_id):
+    from .diagrams import save_message_diagram
+    save_message_diagram(chat_id, message_id)
+    state["diagram_saved_message"] = (chat_id, message_id)
+
+
+def open_rail_section(state, section):
+    from .navigation import request_section
+    if section == "notes":
+        open_notes_view(state)
+    elif section == "study_plan":
+        open_plan_view(state)
+    request_section(state, section)

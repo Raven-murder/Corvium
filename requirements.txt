@@ -9,3 +9,5 @@ Pillow
 pypdfium2
 psycopg[binary]
 psycopg_pool
+graphviz
+reportlab

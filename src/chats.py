@@ -75,6 +75,11 @@ def add_message(chat_id, role, content, sources=None, error=False, kind="text"):
             'INSERT INTO messages(session_id, chat_id, role, content, created_at, sources, error, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
             (str(chat_id), chat_id, role, content, now, json.dumps(sources or []), int(error), kind),
         )
+        if role == "assistant" and kind == "diagram":
+            from .diagrams import parse_diagram_message, save_diagram
+            spec = parse_diagram_message(content)
+            if spec is not None:
+                save_diagram(spec, connection)
         connection.execute("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?", (title, now, chat_id))
         return cursor.fetchone()["id"]
 

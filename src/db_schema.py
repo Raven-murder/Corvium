@@ -4,8 +4,8 @@ from uuid import uuid4
 from .config import StorageError
 from .sqlite_migrations import migrate_legacy
 
-VERSION = 3
-TABLES = ("folders", "documents", "chunks", "memories", "chats", "messages", "plans", "notes", "bookmarks", "files")
+VERSION = 4
+TABLES = ("folders", "documents", "chunks", "memories", "chats", "messages", "plans", "diagrams", "notes", "bookmarks", "files")
 
 
 def table_definitions(dialect):
@@ -21,6 +21,7 @@ def table_definitions(dialect):
         "chats": f"id {pk}, {workspace}, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, pinned_at TEXT",
         "messages": f"id {pk if dialect == 'postgres' else 'INTEGER PRIMARY KEY'}, {workspace}, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, chat_id {reference}, sources TEXT NOT NULL DEFAULT '[]', error INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'text', pinned INTEGER NOT NULL DEFAULT 0, pinned_at TEXT, FOREIGN KEY(workspace_id, chat_id) REFERENCES chats(workspace_id, id) ON DELETE CASCADE",
         "plans": f"id {pk}, {workspace}, title TEXT NOT NULL, body_json TEXT NOT NULL, days INTEGER NOT NULL, created_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0",
+        "diagrams": f"id {pk}, {workspace}, title TEXT NOT NULL, spec_json TEXT NOT NULL, created_at TEXT NOT NULL",
         "notes": f"id {pk}, {workspace}, title TEXT NOT NULL, body TEXT NOT NULL, doc_id {reference} REFERENCES documents(id) ON DELETE SET NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(workspace_id, doc_id) REFERENCES documents(workspace_id, id) DEFERRABLE INITIALLY DEFERRED",
         "bookmarks": f"id {pk}, {workspace}, doc_id {reference} NOT NULL, locator TEXT NOT NULL, label TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(workspace_id, doc_id) REFERENCES documents(workspace_id, id) ON DELETE CASCADE",
         "files": f"id {pk}, {workspace}, doc_id {reference} NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, size_bytes BIGINT NOT NULL, data {blob} NOT NULL, UNIQUE(workspace_id, doc_id), FOREIGN KEY(workspace_id, doc_id) REFERENCES documents(workspace_id, id) ON DELETE CASCADE",
@@ -76,6 +77,14 @@ def migrate_sqlite(connection, workspace_id):
             connection.execute(statement)
         version = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
         if version >= VERSION:
+            connection.commit()
+            return
+        if version >= 3:
+            definition = table_definitions("sqlite")["diagrams"]
+            connection.execute(f"CREATE TABLE IF NOT EXISTS diagrams ({definition})")
+            connection.execute("CREATE INDEX IF NOT EXISTS diagrams_workspace ON diagrams(workspace_id)")
+            connection.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+                               (VERSION, datetime.now(timezone.utc).isoformat()))
             connection.commit()
             return
         for statement in (

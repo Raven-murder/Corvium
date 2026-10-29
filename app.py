@@ -1,6 +1,9 @@
 """Run with: streamlit run app.py"""
 
+from contextlib import nullcontext
+
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.config import APP_NAME, safe_error, StorageError
 from src.chats import list_chats, list_messages, list_pinned_messages, chat_label, pinned_message_label
@@ -8,7 +11,7 @@ from src.library import list_library, list_documents, group_images_by_type, reor
 from src.memory import list_memories
 from src.actions import study_plan_defaults, grade_quiz
 from src.plans import list_plans
-from src.diagrams import parse_diagram_message, presentation_code
+from src.diagrams import parse_diagram_message, render_diagram_png, diagram_outline, diagram_caption, DiagramRenderError, list_saved_diagrams
 from src.sources import (
     group_answer_sources, original_download, open_sources_panel, active_sources_panel,
     dock_sources_panel, sources_panel_dock, close_sources_panel,
@@ -16,9 +19,9 @@ from src.sources import (
 from src import workflows as flow
 from src import viewer as doc_viewer
 from src import search as doc_search
-from src import notes, themes
+from src import notes, themes, navigation, note_exports
 from src.branding import load_logo, DEFAULT_ICON
-from src.workspaces import bind_workspace
+from src.workspaces import bind_workspace, get_storage
 
 
 def run_callback(action, *args):
@@ -41,7 +44,7 @@ def show_delete_dialog():
     if kind == "folder":
         st.write("Delete this folder? Its documents move to unfiled and are not deleted.")
     elif kind == "demo":
-        st.write("Reset demo replaces all current documents, memories and chats with the demo data and removes saved study plans, notes and bookmarks.")
+        st.write("Reset demo replaces all current documents, memories and chats with the demo data and removes saved study plans, notes, bookmarks and diagrams.")
     elif kind == "memories":
         st.write("Delete all saved memories?")
     else:
@@ -82,7 +85,7 @@ def show_actions_panel(documents, memories):
         pending = ("quiz", {"n": int(count), "topic": topic.strip() or None, "difficulty": difficulty, "source_doc_ids": quiz_sources})
     st.divider()
     st.markdown("**Diagram**")
-    diagram_kind = st.selectbox("Type", ["flowchart", "mind map", "sequence"], key="diagram_kind")
+    diagram_kind = st.selectbox("Type", ["flowchart", "mind map"], key="diagram_kind")
     diagram_topic = st.text_input("Topic", key="diagram_topic")
     diagram_sources = st.multiselect("Source documents", ids, default=ids, format_func=labels.get, key="diagram_sources")
     if st.button("Run", key="run_diagram", disabled=not diagram_sources or not diagram_topic.strip()):
@@ -153,7 +156,7 @@ def show_plan_view():
 def show_chat_message(message, chat_id, scope="chat"):
     user = message["role"] == "user"
     with st.container(key=f"message_group_{message['role']}_{scope}_{chat_id}_{message['id']}"):
-        with st.chat_message(message["role"], width="content" if user else "stretch"):
+        with st.chat_message(message["role"], width="stretch"):
             if message.get("error"):
                 st.error(message["content"])
             elif message.get("kind") == "quiz":
@@ -162,7 +165,7 @@ def show_chat_message(message, chat_id, scope="chat"):
                 st.markdown("**Study plan**")
                 st.markdown(message["content"])
             elif message["role"] == "assistant":
-                show_answer(message["content"], f"{scope}_{chat_id}_message_{message['id']}")
+                show_answer(message["content"], f"{scope}_{chat_id}_message_{message['id']}", message.get("kind"), message.get("sources", []))
             else:
                 st.markdown(message["content"])
         with st.container(horizontal=True, wrap=False, horizontal_alignment="right" if user else "left", gap="small",
@@ -174,8 +177,14 @@ def show_chat_message(message, chat_id, scope="chat"):
                     key=f"save_note_{scope}_{chat_id}_{message['id']}", on_click=run_callback,
                     args=(flow.save_answer_to_notes, chat_id, message["id"]),
                 )
+            if message["role"] == "assistant" and message.get("kind") == "diagram" and parse_diagram_message(message["content"]) is not None:
+                st.button("", icon=":material/bookmark_add:", help="Save diagram", type="tertiary", width="content",
+                          key=f"save_diagram_{scope}_{chat_id}_{message['id']}", on_click=run_callback,
+                          args=(flow.save_diagram_from_message, chat_id, message["id"]))
             if message["role"] == "assistant" and message.get("kind") != "quiz":
                 show_sources(message.get("sources", []), message["content"], f"{scope}_{chat_id}_message_{message['id']}")
+        if st.session_state.get("diagram_saved_message") == (chat_id, message["id"]):
+            st.caption("Diagram saved. Insert it from Notes.")
         if st.session_state.get("note_saved_message") == (chat_id, message["id"]):
             st.caption("Saved to notes.")
 
@@ -199,7 +208,7 @@ def show_live_answer(workspace_id, chat_id, message_ids):
     with st.chat_message("assistant", width="stretch"):
         if job["partial_text"]:
             if job["kind"] == "diagram":
-                st.code(job["partial_text"], language=job["language"])
+                st.caption("Drawing your diagram…")
             else:
                 st.markdown(job["partial_text"])
         else:
@@ -246,36 +255,12 @@ def show_memory_panel(memories):
 
 
 
-def show_notes_panel():
-    with st.popover("New note", icon=":material/note_add:", type="tertiary", key="new_note_popover"):
-        with st.form("new_note_form", border=False):
-            st.text_input("Title", max_chars=120, key="new_note_title")
-            st.text_area("Note text", max_chars=20_000, key="new_note_body")
-            st.form_submit_button("Create note", on_click=run_callback, args=(flow.create_note_from_input,))
-    query = st.text_input("Filter notes", key="notes_filter")
-    items = notes.list_notes(query)
-    if not items:
-        st.caption("No matching notes." if query.strip() else "Save an answer or create a note here.")
-    for note in items:
-        note_key = f"note_{note['id']}_{note['updated_at']}"
-        st.text(note["title"])
-        if note["doc_name"]:
-            st.caption(note["doc_name"])
-        st.markdown(note["body"])
-        with st.container(horizontal=True, gap="small", key=f"note_controls_{note['id']}"):
-            with st.popover("", icon=":material/edit:", help="Edit note", type="tertiary", key=f"edit_{note_key}"):
-                with st.form(f"edit_form_{note_key}", border=False):
-                    title_key, body_key = f"title_{note_key}", f"body_{note_key}"
-                    st.text_input("Title", value=note["title"], max_chars=120, key=title_key)
-                    st.text_area("Note text", value=note["body"], max_chars=20_000, key=body_key)
-                    st.form_submit_button("Save", on_click=run_callback,
-                                          args=(flow.update_note_from_input, note["id"], title_key, body_key))
-            marker = "on" if note["pinned"] else "off"
-            st.button("", icon=":material/push_pin:", help="Unpin note" if note["pinned"] else "Pin note", type="tertiary",
-                      key=f"pin_{marker}_note_{note['id']}", on_click=run_callback,
-                      args=(flow.pin_note_from_sidebar, note["id"], not note["pinned"]))
-            st.button("", icon=":material/delete:", help="Delete note", type="tertiary", key=f"delete_note_{note['id']}",
-                      on_click=run_callback, args=(flow.request_destructive_action, "note", note["title"], note["id"]))
+def show_notes_panel(in_dialog=False):
+    if in_dialog:
+        show_notes_view()
+    else:
+        st.button("Notes", icon=":material/edit_note:", width="stretch", key="notes_view",
+                  on_click=run_callback, args=(flow.open_notes_view,))
 
 
 def show_bookmarks_panel():
@@ -410,17 +395,14 @@ def show_manage_chats(chats):
 
 
 def show_pinned_panel():
-    with st.expander("Pinned", icon=":material/push_pin:", expanded=False, key="pinned_messages"):
-        messages = list_pinned_messages()
-        if not messages:
-            st.caption("Pin a message to keep it here.")
-        for message in messages:
-            st.button(
-                pinned_message_label(message), type="tertiary", width="stretch", wrap=True,
-                key=f"pinned_message_{message['chat_id']}_{message['id']}", on_click=run_callback,
-                args=(flow.open_pinned_message, message["chat_id"], message["id"]),
-            )
-            st.caption(message["chat_title"])
+    messages = list_pinned_messages()
+    if not messages:
+        st.caption("Pin a message to keep it here.")
+    for message in messages:
+        st.button(pinned_message_label(message), type="tertiary", width="stretch", wrap=True,
+                  key=f"pinned_message_{message['chat_id']}_{message['id']}", on_click=run_callback,
+                  args=(flow.open_pinned_message, message["chat_id"], message["id"]))
+        st.caption(message["chat_title"])
 
 
 def dismiss_pinned_message():
@@ -445,19 +427,16 @@ def show_pinned_message_dialog():
 
 
 def show_diagram_chart(diagram, message_key, enlarged=False):
+    try:
+        png = render_diagram_png(diagram)
+    except DiagramRenderError as error:
+        st.info(str(error))
+        st.text(diagram_outline(diagram))
+        return None
     size = "large" if enlarged else "inline"
-    with st.container(key=f"diagram_canvas_{size}_{message_key}", border=False, height="content" if enlarged else 420):
-        try:
-            code = presentation_code(diagram, st.session_state.get("theme_preset", "raven"), st.session_state.get("accent_name", "indigo"))
-            if diagram["language"] == "mermaid":
-                render = getattr(st, "mermaid_chart", None) or getattr(st, "mermaid", None)
-                if not callable(render):
-                    raise RuntimeError("Mermaid rendering is unavailable.")
-                render(code, width="content")
-            else:
-                st.graphviz_chart(code, width="content", height="content")
-        except Exception:
-            st.error("The diagram could not be displayed. You can inspect its code below.")
+    with st.container(key=f"diagram_canvas_{size}_{message_key}", border=False):
+        st.image(png, width="content" if enlarged else "stretch", output_format="PNG")
+    return png
 
 
 def dismiss_diagram_view():
@@ -470,26 +449,31 @@ def show_diagram_dialog():
     if diagram is None:
         st.rerun()
         return
-    show_diagram_chart(diagram, diagram["message_key"], enlarged=True)
+    png = show_diagram_chart(diagram["spec"], diagram["message_key"], enlarged=True)
     st.caption(diagram["caption"])
-    with st.expander("View code", expanded=False, key="enlarged_diagram_code"):
-        st.code(diagram["code"], language=diagram["language"])
+    if png is not None:
+        st.download_button("Download PNG", data=png, file_name="diagram.png", mime="image/png", on_click="ignore", key="enlarged_diagram_download")
     st.button("Close", key="close_diagram_view", on_click=run_callback, args=(flow.close_diagram_view,))
 
 
-def show_answer(content, message_key):
+def show_answer(content, message_key, kind=None, sources=()):
     diagram = parse_diagram_message(content)
     if diagram is None:
-        st.markdown(content)
+        if kind == "diagram" or content.lstrip().partition("\n")[0] in {"```mermaid", "```dot", "```graphviz"}:
+            st.caption("This message uses an older diagram format.")
+            with st.expander("Older diagram format", expanded=False, key=f"legacy_diagram_{message_key}"):
+                st.code(content, language="text")
+        else:
+            st.markdown(content)
         return
-    show_diagram_chart(diagram, message_key)
-    st.caption(diagram["caption"])
-    st.button(
-        "Enlarge", icon=":material/open_in_full:", type="tertiary", key=f"enlarge_diagram_{message_key}",
-        on_click=run_callback, args=(flow.open_diagram_view, content, message_key),
-    )
-    with st.expander("View code", expanded=False, key=f"diagram_code_{message_key}"):
-        st.code(diagram["code"], language=diagram["language"])
+    png = show_diagram_chart(diagram, message_key)
+    st.caption(diagram_caption(diagram, sources))
+    with st.container(horizontal=True, gap="small", key=f"diagram_controls_{message_key}"):
+        st.button("Enlarge", icon=":material/open_in_full:", type="tertiary", key=f"enlarge_diagram_{message_key}",
+                  on_click=run_callback, args=(flow.open_diagram_view, content, message_key, sources))
+        if png is not None:
+            st.download_button("Download PNG", data=png, file_name="diagram.png", mime="image/png", on_click="ignore",
+                               type="tertiary", key=f"diagram_download_{message_key}")
 
 
 def show_source_groups(groups, message_key):
@@ -640,6 +624,8 @@ def show_active_dialog():
         show_diagram_dialog()
     elif flow.active_pinned_message(st.session_state) is not None:
         show_pinned_message_dialog()
+    elif st.session_state.get("rail_dialog") in navigation.SECTIONS:
+        show_section_dialog()
 
 
 def show_search_panel():
@@ -716,7 +702,7 @@ def show_sidebar_header(logo):
 
 
 def show_appearance():
-    with st.popover("Appearance", icon=":material/palette:", type="tertiary", key="appearance"):
+    with st.expander("Appearance", icon=":material/palette:", expanded=False, key="appearance"):
         st.radio("Theme", list(themes.PRESETS), index=None, format_func=themes.THEME_LABELS.get,
                  key="theme_preset", on_change=run_callback, args=(themes.change_appearance, st.query_params))
         st.selectbox("Accent", list(themes.ACCENTS), index=None, format_func=str.title,
@@ -726,7 +712,7 @@ def show_appearance():
 def show_empty_chat():
     with st.container(key="empty_chat"):
         with st.container(key="empty_mascot"):
-            logo = load_logo(st.session_state.get("theme_preset", "raven"))
+            logo = load_logo(st.session_state.get("theme_preset", "auto"))
             if logo is not None:
                 st.image(logo, width=72)
             else:
@@ -769,6 +755,172 @@ def show_tips():
     )
 
 
+
+def show_notes_view():
+    st.button("Back to chat", icon=":material/arrow_back:", key="notes_back_to_chat",
+              on_click=run_callback, args=(flow.open_chat_view,))
+    st.subheader("Notes")
+    if st.session_state.get("notes_notice"):
+        st.success(st.session_state.pop("notes_notice"))
+    if st.session_state.get("sidebar_error"):
+        st.error(st.session_state.pop("sidebar_error"))
+    items = notes.list_notes()
+    flow.initialize_notes_selection(st.session_state, items)
+    listing, editor = st.columns([0.28, 0.72], gap="large")
+    with listing:
+        query = st.text_input("Search notes", key="notes_view_filter")
+        st.button("New note", icon=":material/note_add:", key="notes_new", width="stretch",
+                  on_click=run_callback, args=(flow.new_note,))
+        filtered = [note for note in items if not query.strip() or query.strip().casefold() in (note["title"] + " " + note["body"]).casefold()]
+        if not filtered:
+            st.caption("No matching notes." if query.strip() else "Create a note or save an answer here.")
+        for note in filtered:
+            with st.container(horizontal=True, wrap=False, gap="small", key=f"notes_row_{note['id']}"):
+                st.button(note["title"], type="tertiary", width="stretch", wrap=True, key=f"notes_select_{note['id']}",
+                          on_click=run_callback, args=(flow.select_note, note["id"]))
+                st.button("", icon=":material/push_pin:", help="Unpin note" if note["pinned"] else "Pin note", type="tertiary",
+                          width="content", key=f"pin_{'on' if note['pinned'] else 'off'}_notes_page_{note['id']}",
+                          on_click=run_callback, args=(flow.pin_note_from_sidebar, note["id"], not note["pinned"]))
+                st.button("", icon=":material/delete:", help="Delete note", type="tertiary", width="content", key=f"notes_delete_{note['id']}",
+                          on_click=run_callback, args=(flow.request_destructive_action, "note", note["title"], note["id"]))
+        pdf_ready = note_exports.pdf_available()
+        st.download_button("Export all notes", icon=":material/picture_as_pdf:",
+                           data=note_exports.download_data(None, "pdf", get_storage(), all_notes=True) if items and pdf_ready else b"",
+                           file_name=APP_NAME + "-notes.pdf", mime="application/pdf", on_click="ignore", disabled=not items or not pdf_ready,
+                           key="notes_export_all", help="One PDF with a title page and table of contents")
+        if not pdf_ready:
+            st.caption("PDF export is unavailable until reportlab is available.")
+    with editor:
+        note_id = st.session_state.get("selected_note_id")
+        if note_id is None:
+            st.info("Select a note or create a new one.")
+            return
+        note = notes.get_note(note_id)
+        title_key, body_key = flow.note_editor_keys(note_id)
+        st.text_input("Title", max_chars=notes.MAX_TITLE, key=title_key, on_change=run_callback, args=(flow.capture_note_draft, note_id))
+        st.text_area("Body", height=540, max_chars=notes.MAX_BODY, key=body_key, on_change=run_callback, args=(flow.capture_note_draft, note_id))
+        body = st.session_state.get(body_key, "")
+        st.caption(f"{len(body):,} / {notes.MAX_BODY:,} characters")
+        with st.container(horizontal=True, gap="small", key=f"note_editor_actions_{note_id}"):
+            st.button("Save", icon=":material/save:", type="primary", key=f"note_save_{note_id}",
+                      on_click=run_callback, args=(flow.save_note_editor, note_id))
+            st.button("Duplicate", icon=":material/content_copy:", key=f"note_duplicate_{note_id}",
+                      on_click=run_callback, args=(flow.duplicate_note_editor, note_id))
+        saved = list_saved_diagrams()
+        by_id = {diagram["id"]: diagram for diagram in saved}
+        key = f"note_insert_diagram_{note_id}"
+        st.selectbox("Insert diagram", list(by_id), index=None, key=key,
+                     format_func=lambda value: by_id[value]["title"] + " · " + by_id[value]["created_at"][:10])
+        st.button("Insert diagram", icon=":material/add_photo_alternate:", key=f"note_insert_{note_id}",
+                  disabled=st.session_state.get(key) not in by_id, on_click=run_callback,
+                  args=(flow.insert_note_diagram, note_id, key))
+        st.caption("Diagrams are appended at the end; Streamlit cannot insert at the cursor.")
+        snapshot = {**note, "title": st.session_state.get(title_key, "").strip() or "Untitled note", "body": body}
+        with st.container(horizontal=True, gap="small", key=f"note_exports_{note_id}"):
+            for extension, mime in (("txt", "text/plain"), ("md", "text/markdown"), ("pdf", "application/pdf")):
+                available = extension != "pdf" or pdf_ready
+                st.download_button("Markdown" if extension == "md" else extension.upper(),
+                                   data=note_exports.download_data(snapshot, extension, get_storage()) if available else b"",
+                                   file_name=note_exports.filename(snapshot["title"], extension), mime=mime, on_click="ignore",
+                                   disabled=not available, key=f"note_download_{extension}_{note_id}")
+        st.markdown("**Preview**")
+        for index, part in enumerate(notes.preview_parts(body)):
+            if part["kind"] == "markdown":
+                st.markdown(part["text"])
+            elif part["diagram"] is None:
+                st.caption("This diagram is unavailable in this workspace.")
+            else:
+                show_diagram_chart(part["diagram"]["spec"], f"note_preview_{note_id}_{index}")
+
+
+def show_study_plan_section(in_dialog=False):
+    if in_dialog:
+        show_plan_view()
+    else:
+        st.button("Study plan", icon=":material/event_note:", width="stretch", key="study_plan_view",
+                  on_click=run_callback, args=(flow.open_plan_view,))
+
+
+def render_section(section, documents, memories, library, demo_results=(), in_dialog=False):
+    if section == "study_plan":
+        show_study_plan_section(in_dialog)
+        return None
+    if section == "notes":
+        show_notes_panel(in_dialog)
+        return None
+    label, icon, key = navigation.SECTIONS[section]
+    shell = nullcontext() if in_dialog else st.expander(label, icon=f":material/{icon}:", expanded=st.session_state.get("open_section") == section,
+                                                      key=key, on_change="rerun")
+    with shell:
+        if not in_dialog and st.session_state.get("rail_dialog") == section:
+            st.caption("This section is open in a dialog.")
+            return None
+        if section == "tools":
+            return show_actions_panel(documents, memories)
+        if section == "library":
+            for result in demo_results:
+                if result["error"] or result["status"] != "indexed":
+                    st.warning(f"{result['name']}: {result['error'] or result['status']}")
+            show_library_panel(library)
+        elif section == "search":
+            show_search_panel()
+        elif section == "bookmarks":
+            show_bookmarks_panel()
+        elif section == "memory":
+            show_memory_panel(memories)
+        elif section == "tips":
+            show_tips()
+        elif section == "pinned":
+            show_pinned_panel()
+    return None
+
+
+def show_rail():
+    with st.container(key="rail", gap="small"):
+        for section, (label, icon, _) in navigation.SECTIONS.items():
+            st.button("", icon=f":material/{icon}:", help=label, type="tertiary", width="stretch", key=f"rail_{section}",
+                      on_click=run_callback, args=(flow.open_rail_section, section))
+
+
+def show_sidebar_bridge():
+    request = st.session_state.get("rail_request")
+    if not request:
+        return
+    with st.container(key="rail_bridge_host"):
+        component = navigation.bridge_component()
+        if component is None:
+            navigation.finish_bridge(st.session_state, {"token": request["token"], "opened": False})
+            return
+        try:
+            result = component(data={"token": request["token"]}, key="rail_bridge_status", height=0, on_result_change=lambda: None)
+            value = result.result
+        except Exception:
+            navigation.finish_bridge(st.session_state, {"token": request["token"], "opened": False})
+            return
+        if navigation.finish_bridge(st.session_state, value):
+            return
+        components.html(navigation.expansion_script(request), height=0, scrolling=False)
+
+
+def dismiss_section_dialog():
+    run_callback(navigation.close_dialog)
+
+
+@st.dialog("Section", width="large", on_dismiss=dismiss_section_dialog)
+def show_section_dialog():
+    section = st.session_state.get("rail_dialog")
+    if section not in navigation.SECTIONS or any(st.session_state.get(key) for key in (
+        "destructive_confirmation", "viewer_request", "diagram_view", "pinned_message_view", "regenerate_plan_id")):
+        st.rerun()
+        return
+    st.subheader(navigation.SECTIONS[section][0])
+    pending = render_section(section, list_documents(), list_memories(), list_library(), in_dialog=True)
+    if pending:
+        st.session_state["pending_tool"] = pending
+        navigation.close_dialog(st.session_state)
+        st.rerun()
+    st.button("Close", key="close_rail_section", on_click=run_callback, args=(navigation.close_dialog,))
+
 def main():
     bind_workspace(st.query_params, st.session_state)
     theme, accent = themes.initialize_appearance(st.session_state, st.query_params)
@@ -786,11 +938,12 @@ def main():
     except Exception as error:
         st.error(safe_error(error))
         st.stop()
+    show_sidebar_bridge()
+    show_rail()
     with st.sidebar:
         show_sidebar_header(logo)
         st.button("New chat", icon=":material/add_comment:", type="primary", width="stretch", key="new_chat", on_click=run_callback, args=(flow.new_chat,))
-        st.button("Study plan", icon=":material/event_note:", width="stretch", key="study_plan_view",
-                  on_click=run_callback, args=(flow.open_plan_view,))
+        render_section("study_plan", documents, memories, library)
         if st.session_state.get("sidebar_error"):
             st.error(st.session_state.pop("sidebar_error"))
         try:
@@ -798,34 +951,20 @@ def main():
             titles = {chat["id"]: chat_label(chat) for chat in chats}
             chat_id = st.selectbox("Chat", list(titles), format_func=titles.get, key="selected_chat_id", label_visibility="collapsed")
             show_manage_chats(chats)
-            show_pinned_panel()
+            render_section("pinned", documents, memories, library)
         except Exception as error:
             st.error(safe_error(error))
             st.stop()
-        with st.expander("Tools", icon=":material/build:", expanded=False, key="tools", on_change="rerun"):
-            pending = show_actions_panel(documents, memories)
-        with st.expander("Library", icon=":material/folder:", expanded=False, key="library"):
-            for result in demo_results:
-                if result["error"] or result["status"] != "indexed":
-                    st.warning(f"{result['name']}: {result['error'] or result['status']}")
-            show_library_panel(library)
-        with st.expander("Search", icon=":material/search:", expanded=False, key="document_search"):
-            show_search_panel()
-        with st.expander("Notes", icon=":material/edit_note:", expanded=False, key="notes"):
-            show_notes_panel()
-        with st.expander("Bookmarks", icon=":material/bookmark:", expanded=False, key="bookmarks"):
-            show_bookmarks_panel()
-        with st.expander("Memory", icon=":material/psychology:", expanded=False, key="memory"):
-            show_memory_panel(memories)
-        with st.expander("Tips", icon=":material/lightbulb:", expanded=False, key="tips"):
-            show_tips()
+        pending = render_section("tools", documents, memories, library)
+        for section in ("library", "search", "notes", "bookmarks", "memory", "tips"):
+            render_section(section, documents, memories, library, demo_results)
         with st.container(key="sidebar_footer"):
             st.caption(f"{APP_NAME} answers are generated by Nebius-hosted NVIDIA Nemotron; text you upload is sent to the API.")
             st.button("Reset demo", key="reset_demo", on_click=run_callback,
                       args=(flow.request_destructive_action, "demo", "Reset demo"))
             show_appearance()
     starter_question, starter_tool = flow.consume_starter(st.session_state)
-    pending = pending or starter_tool
+    pending = pending or st.session_state.pop("pending_tool", None) or starter_tool
     if pending:
         try:
             if pending[0] == "diagram":
@@ -844,7 +983,13 @@ def main():
         except Exception as error:
             st.error(safe_error(error))
     if st.session_state.get("view", "chat") == "plan":
-        show_plan_view()
+        if st.session_state.get("rail_dialog") != "study_plan":
+            show_plan_view()
+        show_active_dialog()
+        return
+    if st.session_state.get("view") == "notes":
+        if st.session_state.get("rail_dialog") != "notes":
+            show_notes_view()
         show_active_dialog()
         return
     if st.session_state.get("chat_notice"):

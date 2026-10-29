@@ -21,10 +21,10 @@ def wcag_contrast(first, second):
 
 class ThemesTests(unittest.TestCase):
     def test_exactly_four_presets_have_accessible_text_and_muted_contrast(self):
-        self.assertEqual(set(themes.PRESETS), {"raven", "light", "midnight", "eye_comfort"})
+        self.assertEqual(set(themes.PRESETS), {"auto", "light", "dark", "eye_comfort"})
         for name, colors in themes.PRESETS.items():
             with self.subTest(theme=name):
-                self.assertEqual(set(colors), {"bg", "surface", "border", "text", "muted"})
+                self.assertEqual(set(colors), {"bg", "surface", "surface2", "border", "text", "muted"})
                 self.assertGreaterEqual(wcag_contrast(colors["text"], colors["bg"]), 4.5)
                 self.assertGreaterEqual(wcag_contrast(colors["text"], colors["surface"]), 4.5)
                 self.assertGreaterEqual(wcag_contrast(colors["muted"], colors["bg"]), 3)
@@ -32,7 +32,7 @@ class ThemesTests(unittest.TestCase):
         self.assertEqual(themes.contrast("#000000", "#FFFFFF"), 21)
 
     def test_all_accents_choose_higher_contrast_text_and_readable_light_variant(self):
-        self.assertEqual(set(themes.ACCENTS), {"indigo", "violet", "teal", "cyan", "rose", "amber"})
+        self.assertEqual(set(themes.ACCENTS), {"blue", "violet", "green", "amber", "red", "slate"})
         for name, color in themes.ACCENTS.items():
             with self.subTest(accent=name):
                 text = themes.accent_text(name)
@@ -49,25 +49,25 @@ class ThemesTests(unittest.TestCase):
             with self.subTest(value=invalid):
                 query = {"w": "a" * 32, "t": invalid, "a": invalid}
                 state = {}
-                self.assertEqual(themes.initialize_appearance(state, query), ("raven", "indigo"))
-                self.assertEqual(query, {"w": "a" * 32, "t": "raven", "a": "indigo"})
+                self.assertEqual(themes.initialize_appearance(state, query), ("auto", "blue"))
+                self.assertEqual(query, {"w": "a" * 32, "t": "auto", "a": "blue"})
                 css = themes.styles(invalid, invalid)
                 self.assertEqual(css, themes.styles())
                 self.assertNotIn("<script>", css)
         state = {"theme_preset": "midnight", "accent_name": "rose"}
-        self.assertEqual(themes.initialize_appearance(state, {"t": "bad", "a": "bad"}), ("midnight", "rose"))
+        self.assertEqual(themes.initialize_appearance(state, {"t": "bad", "a": "bad"}), ("auto", "blue"))
 
     def test_valid_appearance_round_trip_keeps_workspace_and_other_query_values(self):
         state = {}
         query = {"w": "b" * 32, "t": "light", "a": "teal", "other": "preserved"}
-        self.assertEqual(themes.initialize_appearance(state, query), ("light", "teal"))
+        self.assertEqual(themes.initialize_appearance(state, query), ("light", "green"))
         state.update(theme_preset="eye_comfort", accent_name="amber")
         themes.change_appearance(state, query)
         self.assertEqual(query, {"w": "b" * 32, "t": "eye_comfort", "a": "amber", "other": "preserved"})
         self.assertEqual(themes.initialize_appearance({}, query), ("eye_comfort", "amber"))
         state.update(theme_preset="invalid", accent_name="invalid")
         themes.change_appearance(state, query)
-        self.assertEqual((query["t"], query["a"], query["w"]), ("raven", "indigo", "b" * 32))
+        self.assertEqual((query["t"], query["a"], query["w"]), ("auto", "blue", "b" * 32))
 
     def test_css_covers_widgets_and_eye_comfort_contains_no_white_text_color(self):
         css = themes.styles("eye_comfort", "amber")
@@ -78,27 +78,24 @@ class ThemesTests(unittest.TestCase):
             self.assertIn(token, css)
         self.assertEqual(css.count("<style>"), 1)
         base = (Path(__file__).resolve().parents[1] / ".streamlit" / "config.toml").read_text(encoding="utf-8")
-        for color in ("#0A0B10", "#12141C", "#E8EAF2", "#7C8CFF"):
-            self.assertIn(color, base)
+        import tomllib
+        self.assertEqual(tomllib.loads(base)["theme"], {"primaryColor": "#4F7CFF"})
+        self.assertIn("@media (prefers-color-scheme: dark)", themes.styles())
 
-    def test_diagram_presentation_sets_trusted_theme_without_changing_saved_code(self):
-        source = "flowchart TD\n A[Begin] --> B[Commit]"
-        diagram = {"language": "mermaid", "code": source}
+    def test_diagram_palette_is_fixed_and_does_not_mutate_saved_spec(self):
+        source = {"type": "flowchart", "title": "Transactions", "nodes": [
+            {"id": "A", "label": "Begin", "kind": "start"}, {"id": "B", "label": "Commit", "kind": "end"}],
+            "edges": [{"from": "A", "to": "B"}]}
+        original = json.dumps(source)
         for name in themes.PRESETS:
-            rendered = diagrams.presentation_code(diagram, name, "rose")
-            header, remainder = rendered.split("\n---\n", 1)
-            settings = json.loads(header.removeprefix("---\nconfig: "))
-            self.assertEqual(settings["theme"], "neutral" if name == "light" else "dark")
-            self.assertEqual(settings["themeVariables"]["primaryTextColor"], themes.PRESETS[name]["text"])
-            self.assertEqual(settings["themeVariables"]["fontSize"], "16px")
-            self.assertFalse(settings["flowchart"]["useMaxWidth"])
-            self.assertEqual(remainder, diagrams.sanitize_diagram(source))
-        self.assertEqual(diagram["code"], source)
-        with self.assertRaises(ValueError):
-            diagrams.presentation_code({"language": "mermaid", "code": source + '\n click A "http://example.com"'})
-        dot = diagrams.presentation_code({"language": "dot", "code": "digraph Notes { A -> B; }"}, "eye_comfort")
-        self.assertIn('fontcolor="#E3DCCB"', dot)
-        self.assertIn("fontsize=16", dot)
+            graph = MagicMock()
+            module = SimpleNamespace(Digraph=Mock(return_value=graph), escape=lambda label: label)
+            with patch.dict("sys.modules", {"graphviz": module}):
+                diagrams._build_graph(source)
+            self.assertEqual(graph.attr.call_args_list[0].kwargs["bgcolor"], "#FFFFFF")
+            self.assertEqual(graph.attr.call_args_list[0].kwargs["dpi"], "200")
+            self.assertTrue(all(call.kwargs["fillcolor"] == "#DCFCE7" for call in graph.node.call_args_list))
+            self.assertEqual(json.dumps(source), original)
 
 
 class BrandingTests(unittest.TestCase):
@@ -118,7 +115,7 @@ class BrandingTests(unittest.TestCase):
         with patch.object(Path, "stat", return_value=SimpleNamespace(st_mtime_ns=1, st_size=10)), \
                 patch.object(branding, "_load_image", side_effect=read) as load:
             self.assertIs(branding.load_logo("light"), light)
-            for theme in ("raven", "midnight", "eye_comfort"):
+            for theme in ("auto", "dark", "eye_comfort"):
                 self.assertIs(branding.load_logo(theme), normal)
             self.assertEqual(sum(Path(call.args[0]).name == "raven_light.png" for call in load.call_args_list), 1)
         with patch.object(Path, "stat", return_value=SimpleNamespace(st_mtime_ns=2, st_size=10)), \

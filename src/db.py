@@ -672,6 +672,9 @@ def _clone_rows(connection, source_id, target_id):
                 values["sources"] = _remap_json(values["sources"], maps)
             if table == "plans":
                 values["body_json"] = _remap_json(values["body_json"], maps)
+            if table == "notes":
+                values["body"] = re.sub(r"(!\[[^\]\n]*\]\(diagram:)([1-9]\d{0,18})(\))",
+                                        lambda match: match[1] + str(maps["diagrams"].get(int(match[2]), match[2])) + match[3], values["body"])
             if table == "documents":
                 values["stored_path"] = None
             columns = list(values)
@@ -808,7 +811,7 @@ def _import_legacy_usage(raw):
     old = config.DATA_DIR / "usage.db"
     raw.execute("BEGIN IMMEDIATE")
     try:
-        if raw.execute("SELECT 1 FROM schema_version WHERE version = ?", (VERSION,)).fetchone():
+        if raw.execute("SELECT 1 FROM schema_version WHERE version >= ?", (3,)).fetchone():
             raw.commit()
             return
         if old.is_file():
@@ -822,7 +825,7 @@ def _import_legacy_usage(raw):
                     raw.execute("INSERT INTO usage_events(workspace_id, kind, created_at) VALUES (?, ?, ?)", (workspace_id, kind, created))
             finally:
                 source.close()
-        raw.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?) ON CONFLICT(version) DO NOTHING", (VERSION, datetime.now(timezone.utc).isoformat()))
+        raw.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?) ON CONFLICT(version) DO NOTHING", (3, datetime.now(timezone.utc).isoformat()))
         raw.commit()
     except BaseException:
         raw.rollback()
