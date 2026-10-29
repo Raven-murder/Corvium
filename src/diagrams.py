@@ -7,6 +7,13 @@ import textwrap
 import streamlit as st
 
 if __package__:
+    from .read_cache import cached_list
+    from . import perf
+else:
+    from read_cache import cached_list
+    import perf
+
+if __package__:
     from .config import CHAT_MODEL, get_client, StorageError
     from .generation import stream_completion
     from .ingest import search
@@ -231,6 +238,7 @@ def _build_graph(spec):
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
+@perf.operation("graphviz.dot.render")
 def _cached_png(spec_hash, _spec_json):
     spec = sanitize_diagram(_spec_json)
     try:
@@ -333,6 +341,7 @@ def save_diagram(spec, connection=None):
                               (spec["title"], content, datetime.now(timezone.utc).isoformat())).fetchone()["id"]
 
 
+@cached_list
 def list_saved_diagrams():
     from .db import database_session
     with database_session() as connection:

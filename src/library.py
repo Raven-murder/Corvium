@@ -1,3 +1,4 @@
+from .read_cache import cached_list
 from pathlib import Path
 
 from .db import database_session
@@ -93,6 +94,7 @@ def reorder_document(document_id, direction):
         _set_positions(connection, ids)
 
 
+@cached_list
 def list_library():
     """Return folder groups, unfiled documents, and images without duplication."""
     with database_session() as connection:
@@ -114,6 +116,7 @@ def list_library():
     return {"folders": folders, "unfiled": unfiled, "images": images}
 
 
+@cached_list
 def list_documents():
     with database_session() as connection:
         return [dict(row) for row in connection.execute("SELECT * FROM documents ORDER BY position, id")]

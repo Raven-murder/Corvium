@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 with patch("dotenv.load_dotenv"):
-    from src import chats, db, notes, viewer, workflows, workspaces
+    from src import chats, config, db, notes, viewer, workflows, workspaces
 
 
 class NotesBookmarksTests(unittest.TestCase):
@@ -94,13 +94,13 @@ class NotesBookmarksTests(unittest.TestCase):
         self.assertEqual(notes.list_bookmarks(), [])
 
     def test_title_body_limits_and_invalid_records_do_not_write(self):
-        valid = notes.create_note("T" * 120, "B" * 20_000)
+        valid = notes.create_note("T" * 120, "B" * 100_000)
         for operation in (lambda: notes.create_note("T" * 121, "body"),
-                          lambda: notes.create_note("Title", "B" * 20_001),
+                          lambda: notes.create_note("Title", "B" * 100_001),
                           lambda: notes.create_note(" ", "body"),
                           lambda: notes.create_note("Title", None),
                           lambda: notes.create_note("Title", "body", 999),
-                          lambda: notes.update_note(valid, "Too long", "B" * 20_001),
+                          lambda: notes.update_note(valid, "Too long", "B" * 100_001),
                           lambda: notes.pin_note(valid, "false"),
                           lambda: notes.add_bookmark(999, "1"),
                           lambda: notes.add_bookmark(self.doc_id, ""),
@@ -108,7 +108,7 @@ class NotesBookmarksTests(unittest.TestCase):
             with self.subTest(operation=operation), self.assertRaises(ValueError):
                 operation()
         self.assertEqual(len(notes.list_notes()), 1)
-        self.assertEqual(len(notes.list_notes()[0]["body"]), 20_000)
+        self.assertEqual(len(notes.list_notes()[0]["body"]), 100_000)
         self.assertEqual(notes.list_bookmarks(), [])
 
     def test_note_cap_allows_updates_and_releases_a_slot_on_delete(self):
@@ -209,20 +209,45 @@ class NotesBookmarksTests(unittest.TestCase):
         self.assertEqual(notes.list_notes(), [])
         self.assertEqual(notes.list_bookmarks(), [])
 
-    def test_note_ui_uses_safe_markdown_and_forms(self):
-        notes.create_note("My note", "<script>unsafe()</script>**Study this**")
+    def test_note_ui_opens_main_editor_with_safe_preview_and_confirmed_delete(self):
+        body = "<script>unsafe()</script>**Study this**"
+        note_id = notes.create_note("My note", body)
         tree = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
-        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "show_notes_panel")
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in {"show_notes_panel", "show_notes_view"}]
         ui = MagicMock()
         ui.text_input.return_value = ""
+        ui.columns.return_value = [ui, ui]
         ui.session_state = {}
-        namespace = {"st": ui, "notes": notes, "flow": workflows, "run_callback": Mock()}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<notes-ui>", "exec"), namespace)
+        exports = Mock()
+        exports.pdf_available.return_value = False
+        exports.download_data.return_value = b"fixture"
+        exports.filename.side_effect = lambda title, extension: title + "." + extension
+        namespace = {"st": ui, "notes": notes, "flow": workflows, "run_callback": Mock(),
+                     "APP_NAME": config.APP_NAME, "note_exports": exports,
+                     "get_storage": workspaces.get_storage, "list_saved_diagrams": Mock(return_value=[]),
+                     "show_diagram_chart": Mock()}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<notes-ui>", "exec"), namespace)
         namespace["show_notes_panel"]()
-        self.assertEqual(ui.markdown.call_args.args[0], "<script>unsafe()</script>**Study this**")
-        self.assertFalse(ui.markdown.call_args.kwargs.get("unsafe_allow_html", False))
+        ui.popover.assert_not_called()
+        ui.markdown.assert_not_called()
+        entry = ui.button.call_args
+        self.assertEqual(entry.kwargs["args"], (workflows.open_notes_view,))
+        action, *args = entry.kwargs["args"]
+        action(ui.session_state, *args)
+        self.assertEqual(ui.session_state["view"], "notes")
+        namespace["show_notes_view"]()
+        self.assertEqual(ui.session_state["selected_note_id"], note_id)
+        preview = next(call for call in ui.markdown.call_args_list if call.args[0] == body)
+        self.assertFalse(preview.kwargs.get("unsafe_allow_html", False))
+        self.assertGreaterEqual(ui.text_area.call_args.kwargs["height"], 520)
+        self.assertEqual(ui.text_area.call_args.kwargs["max_chars"], notes.MAX_BODY)
+        controls = {call.kwargs.get("key"): call for call in ui.button.call_args_list}
+        self.assertIs(controls[f"note_save_{note_id}"].kwargs["args"][0], workflows.save_note_editor)
+        self.assertIs(controls[f"note_duplicate_{note_id}"].kwargs["args"][0], workflows.duplicate_note_editor)
+        self.assertIs(controls["notes_back_to_chat"].kwargs["args"][0], workflows.open_chat_view)
         delete = next(call for call in ui.button.call_args_list if call.kwargs.get("help") == "Delete note")
-        self.assertIs(delete.kwargs["args"][0], workflows.request_destructive_action)
+        self.assertEqual(delete.kwargs["args"], (workflows.request_destructive_action, "note", "My note", note_id))
 
 
 class NotesMigrationTests(unittest.TestCase):

@@ -2,6 +2,8 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from datetime import datetime, timezone
 import hashlib
 import logging
@@ -9,7 +11,7 @@ import mimetypes
 from pathlib import Path
 import re
 import sqlite3
-from threading import RLock
+from threading import RLock, get_ident
 import time
 from uuid import uuid4
 
@@ -21,7 +23,7 @@ if not __package__:
     __package__ = "src"
     sys.modules["src.db"] = sys.modules[__name__]
 
-from . import config
+from . import config, perf
 from .config import StorageError
 from .db_schema import TABLES, VERSION, base_statements, migrate_postgres, migrate_sqlite
 from .db_sql import Row, parameter_count, postgres_sql, scoped_sql
@@ -29,6 +31,10 @@ from .sqlite_migrations import infer_document_kind
 
 _POOL = None
 _POOL_KEY = None
+_PG_READY = False
+_RUN_READS = ContextVar("corvium_rerun_reads", default=None)
+_CONNECTION_TIMES = OrderedDict()
+_CONNECTION_TIMES_LOCK = RLock()
 _POOL_LOCK = RLock()
 _MIGRATION_LOCK = RLock()
 _MIGRATED = set()
@@ -40,6 +46,128 @@ _SIZE_LOCK = RLock()
 _DATABASE_SIZE = (float("-inf"), 0)
 _GENERATIONS = {}
 _GENERATION_LOCK = RLock()
+
+
+class _ReadRun:
+    def __init__(self):
+        self.thread = get_ident()
+        self.raw, self.pool, self.busy = None, None, None
+        self.rows = {}
+        self.pending = False
+
+    def close(self):
+        try:
+            if self.busy is not None:
+                self.busy.close()
+        finally:
+            if self.raw is not None:
+                raw, self.raw = self.raw, None
+                try:
+                    self.pool.putconn(raw)
+                except Exception:
+                    raise StorageError() from None
+
+
+def _read_scope():
+    scope = _RUN_READS.get()
+    return scope if scope is not None and scope.thread == get_ident() else None
+
+
+@contextmanager
+def rerun_reads():
+    if backend() != "postgres":
+        yield
+        return
+    scope = _read_scope()
+    owns = scope is None or scope.pending
+    if scope is None:
+        scope = _ReadRun()
+        _RUN_READS.set(scope)
+    scope.pending = False
+    try:
+        yield
+    finally:
+        if owns:
+            try:
+                scope.close()
+            finally:
+                _RUN_READS.set(None)
+
+
+def read_entry(function):
+    @wraps(function)
+    def entered(*args, **kwargs):
+        with rerun_reads():
+            return function(*args, **kwargs)
+    return entered
+
+
+def read_callback(function):
+    @wraps(function)
+    def entered(*args, **kwargs):
+        if backend() != "postgres":
+            return function(*args, **kwargs)
+        scope = _read_scope()
+        owns = scope is None
+        if scope is None:
+            scope = _ReadRun()
+            scope.pending = True
+            _RUN_READS.set(scope)
+        try:
+            return function(*args, **kwargs)
+        except BaseException:
+            if owns:
+                try:
+                    scope.close()
+                finally:
+                    _RUN_READS.set(None)
+            raise
+    return entered
+
+
+def _postgres_connection(workspace_id=None, administrative=False):
+    scope = _read_scope()
+    if scope is not None and scope.busy is None:
+        if scope.raw is None:
+            scope.raw, scope.pool = _checkout()
+        return _Connection(scope.raw, "postgres", workspace_id, scope.pool, administrative, lease=scope)
+    raw, pool = _checkout()
+    return _Connection(raw, "postgres", workspace_id, pool, administrative)
+
+
+def _returned_connection(connection):
+    with _CONNECTION_TIMES_LOCK:
+        _CONNECTION_TIMES[id(connection)] = time.monotonic()
+        _CONNECTION_TIMES.move_to_end(id(connection))
+        while len(_CONNECTION_TIMES) > 64:
+            _CONNECTION_TIMES.popitem(last=False)
+
+
+def _configure_connection(connection):
+    _run(connection, "postgres", "SET statement_timeout = 20000")
+    _run(connection, "postgres", "SET search_path = public")
+    _returned_connection(connection)
+
+
+def _check_idle_connection(connection):
+    with _CONNECTION_TIMES_LOCK:
+        last = _CONNECTION_TIMES.get(id(connection), float("-inf"))
+    if time.monotonic() - last > 30:
+        from psycopg_pool import ConnectionPool
+        ConnectionPool.check_connection(connection)
+    _returned_connection(connection)
+
+
+def initialization_needed():
+    return backend() != "postgres" or not _PG_READY
+
+
+def forget_workspace(workspace_id):
+    with _GENERATION_LOCK:
+        _GENERATIONS.pop(workspace_id, None)
+    scope = _read_scope()
+    if scope is not None:
+        scope.rows.pop(workspace_id, None)
 
 
 class StorageLimitError(ValueError):
@@ -83,9 +211,9 @@ def _pool():
             options = conninfo_to_dict(url)
             options.setdefault("sslmode", "require")
             options.update(connect_timeout=10, prepare_threshold=None, row_factory=dict_row, autocommit=True)
-            options["options"] = (options.get("options", "") + " -c statement_timeout=20000 -c search_path=public").strip()
             pool = ConnectionPool(min_size=1, max_size=5, kwargs=options, open=False,
-                                  check=ConnectionPool.check_connection, timeout=10,
+                                  configure=_configure_connection, reset=_returned_connection,
+                                  check=_check_idle_connection, timeout=10,
                                   reconnect_timeout=30, name="corvium-storage")
             pool.open()
             _POOL, _POOL_KEY = pool, key
@@ -150,16 +278,30 @@ class _Cursor:
 
 
 class _Connection:
-    def __init__(self, raw, dialect, workspace_id=None, pool=None, administrative=False):
+    def __init__(self, raw, dialect, workspace_id=None, pool=None, administrative=False, lease=None):
         self._raw, self.dialect, self.workspace_id = raw, dialect, workspace_id
         self._pool, self._administrative = pool, administrative
         self.in_transaction, self.locked, self.closed = False, False, False
         self.vector_dirty = False
+        self.lease = lease
+        self.dirty_workspaces = set()
 
     def _run(self, sql, params=()):
+        if self.closed:
+            raise StorageError()
+        if self.lease is not None and self.lease.busy not in (None, self):
+            self._raw, self._pool = _checkout()
+            self.lease = None
         return _run(self._raw, self.dialect, sql, params)
 
     def _begin(self, write=False):
+        if self.dialect == "postgres" and not write:
+            return
+        if self.lease is not None and self.lease.busy not in (None, self):
+            self._raw, self._pool = _checkout()
+            self.lease = None
+        if self.lease is not None:
+            self.lease.busy = self
         if not self.in_transaction:
             self._run("BEGIN IMMEDIATE" if write and self.dialect == "sqlite" else "BEGIN")
             self.in_transaction = True
@@ -175,6 +317,8 @@ class _Connection:
                     raise ValueError("This item is not available in the current workspace.")
 
     def execute(self, sql, params=()):
+        if self.closed:
+            raise StorageError()
         command = sql.strip().upper()
         if command in {"BEGIN", "BEGIN IMMEDIATE"}:
             self._begin(write=True)
@@ -203,6 +347,8 @@ class _Connection:
             if table in {"documents", "chunks"}:
                 self.vector_dirty = True
         result = self._run(sql, params)
+        if operation in {"INSERT", "UPDATE", "DELETE"} and result.rowcount:
+            self.dirty_workspaces.add(self.workspace_id)
         if operation == "INSERT" and table == "documents" and result.lastrowid is not None:
             self._run("UPDATE documents SET display_name = COALESCE(display_name, name), kind = COALESCE(kind, ?), position = COALESCE(position, (SELECT COALESCE(MAX(d.position), -1) + 1 FROM documents d WHERE d.workspace_id = ? AND d.folder_id IS NOT DISTINCT FROM documents.folder_id AND d.id != documents.id)) WHERE id = ? AND workspace_id = ?".replace("IS NOT DISTINCT FROM", "IS" if self.dialect == "sqlite" else "IS NOT DISTINCT FROM"),
                       (infer_document_kind(values.get("name", "")), self.workspace_id, result.lastrowid, self.workspace_id))
@@ -218,6 +364,12 @@ class _Connection:
         if self.in_transaction:
             self._run("COMMIT")
             self.in_transaction, self.locked = False, False
+            if self.lease is not None and self.lease.busy is self:
+                self.lease.busy = None
+            from .jobs import bump_data_version
+            for workspace_id in self.dirty_workspaces:
+                bump_data_version(workspace_id)
+            self.dirty_workspaces.clear()
             if self.vector_dirty:
                 invalidate_vectors(self.workspace_id)
                 self.vector_dirty = False
@@ -228,6 +380,9 @@ class _Connection:
                 self._run("ROLLBACK")
             finally:
                 self.in_transaction, self.locked = False, False
+                self.dirty_workspaces.clear()
+                if self.lease is not None and self.lease.busy is self:
+                    self.lease.busy = None
 
     def close(self):
         if self.closed:
@@ -237,7 +392,8 @@ class _Connection:
         finally:
             self.closed = True
             try:
-                self._pool.putconn(self._raw) if self._pool is not None else self._raw.close()
+                if self.lease is None:
+                    self._pool.putconn(self._raw) if self._pool is not None else self._raw.close()
             except Exception:
                 raise StorageError() from None
 
@@ -273,7 +429,10 @@ def _storage():
 
 
 def init_db():
+    global _PG_READY
     dialect = backend()
+    if dialect == "postgres" and _PG_READY:
+        return
     if dialect == "sqlite":
         storage = _storage()
         from .workspaces import ensure_workspace, bound_database_identity, database_identity
@@ -294,6 +453,7 @@ def init_db():
                 migrate_postgres(connection._run)
                 connection.commit()
                 _MIGRATED.add(key)
+                _PG_READY = True
             except BaseException:
                 connection.rollback()
                 raise
@@ -320,11 +480,12 @@ def init_db():
 
 
 def connect():
+    if backend() == "postgres":
+        if not _PG_READY:
+            init_db()
+        return _postgres_connection(current_workspace_id())
     init_db()
     storage, workspace_id = _storage(), current_workspace_id()
-    if backend() == "postgres":
-        raw, pool = _checkout()
-        return _Connection(raw, "postgres", workspace_id, pool)
     from .workspaces import bound_database_identity, database_identity
     identity = bound_database_identity()
     if identity is not None and database_identity(storage) != identity:
@@ -361,12 +522,12 @@ def execute(sql, params=(), fetch=None):
 
 
 @contextmanager
-def _admin_session(registry=False):
+def _admin_session(registry=False, write=True):
     dialect = backend()
     if dialect == "postgres":
-        init_db()
-        raw, pool = _checkout()
-        connection = _Connection(raw, dialect, pool=pool, administrative=True)
+        if not _PG_READY:
+            init_db()
+        connection = _postgres_connection(administrative=True)
     elif registry:
         path = config.DATA_DIR / "registry.db"
         raw = _sqlite_open(path)
@@ -386,7 +547,7 @@ def _admin_session(registry=False):
         init_db()
         connection = _Connection(_sqlite_open(_storage().db_path), dialect, administrative=True)
     try:
-        connection._begin(write=True)
+        connection._begin(write=write)
         with connection:
             yield connection
     finally:
@@ -459,7 +620,7 @@ def check_upload_guard(connection=None):
         if connection is not None:
             size = _database_size(connection)
         else:
-            with _admin_session() as current:
+            with _admin_session(write=False) as current:
                 size = _database_size(current)
     if size > config.DB_SOFT_LIMIT_MB * 1024 * 1024:
         raise StorageLimitError("Uploads are temporarily unavailable because storage is full. Please try again later.")
@@ -500,8 +661,6 @@ def _import_legacy_files(raw, storage):
 
 
 def invalidate_vectors(workspace_id):
-    with _GENERATION_LOCK:
-        _GENERATIONS.pop(workspace_id, None)
     with _VECTOR_LOCK:
         for key in list(_VECTORS):
             if key[0] == workspace_id:
@@ -553,22 +712,61 @@ def _workspace_connection():
 
 def _workspace_info(workspace_id):
     _valid_internal_id(workspace_id)
-    with _workspace_connection() as connection:
-        return connection._run("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if backend() != "postgres":
+        with _workspace_connection() as connection:
+            return connection._run("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    scope = _read_scope()
+    if scope is not None and workspace_id in scope.rows:
+        return scope.rows[workspace_id]
+    if not _PG_READY:
+        init_db()
+    connection = _postgres_connection(workspace_id, administrative=True)
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = datetime.fromtimestamp(now.timestamp() - 300, timezone.utc).isoformat()
+        row = connection._run("""WITH touched AS (
+            UPDATE workspaces SET last_active_at = ? WHERE id = ? AND last_active_at < ? RETURNING *
+        ), selected AS (
+            SELECT * FROM touched UNION ALL
+            SELECT * FROM workspaces WHERE id = ? AND NOT EXISTS (SELECT 1 FROM touched)
+        ) SELECT selected.*, EXISTS(SELECT 1 FROM documents d WHERE d.workspace_id = selected.id) AS has_documents
+          FROM selected""", (now.isoformat(), workspace_id, cutoff, workspace_id)).fetchone()
+    finally:
+        connection.close()
+    if scope is not None:
+        scope.rows[workspace_id] = row
+    if row is not None:
+        _remember_workspace(row)
+    return row
+
+
+def _remember_workspace(row):
+    identity = ("postgres", row["id"], row["generation"])
+    with _GENERATION_LOCK:
+        _GENERATIONS[row["id"]] = time.monotonic(), identity
+    return identity
+
+
+def known_workspace_identity(workspace_id):
+    scope = _read_scope()
+    row = scope.rows.get(workspace_id) if scope is not None else None
+    if row is not None:
+        return "postgres", workspace_id, row["generation"]
+    with _GENERATION_LOCK:
+        value = _GENERATIONS.get(workspace_id)
+        return value[1] if value is not None else None
 
 
 def _workspace_generation(workspace_id):
-    with _GENERATION_LOCK:
-        cached = _GENERATIONS.get(workspace_id)
-        if cached is not None and time.monotonic() - cached[0] < 5:
-            return cached[1]
+    if _read_scope() is None:
+        with _GENERATION_LOCK:
+            cached = _GENERATIONS.get(workspace_id)
+            if cached is not None and time.monotonic() - cached[0] < 5:
+                return cached[1]
     row = _workspace_info(workspace_id)
     if row is None:
         raise StorageError()
-    identity = ("postgres", workspace_id, row["generation"])
-    with _GENERATION_LOCK:
-        _GENERATIONS[workspace_id] = time.monotonic(), identity
-    return identity
+    return _remember_workspace(row)
 
 
 def _make_workspace(workspace_id, ready=1):
@@ -577,6 +775,8 @@ def _make_workspace(workspace_id, ready=1):
     with _workspace_connection() as connection:
         connection._run("INSERT INTO workspaces(id, created_at, last_active_at, generation, ready) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
                         (workspace_id, now, now, uuid4().hex, ready))
+
+    forget_workspace(workspace_id)
 
 
 def create_workspace(workspace_id):
@@ -626,6 +826,7 @@ def template_lock():
 
 
 def _clear_rows(connection, workspace_id):
+    connection.dirty_workspaces.add(workspace_id)
     for table in reversed(TABLES):
         connection._run(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace_id,))
 
@@ -655,6 +856,11 @@ def _remap_json(value, maps):
 
 
 def _clone_rows(connection, source_id, target_id):
+    connection.dirty_workspaces.add(target_id)
+    if connection.dialect == "postgres":
+        from .postgres_clone import clone_rows
+        clone_rows(connection, source_id, target_id)
+        return {}
     maps = {table: {} for table in TABLES}
     references = {"folder_id": "folders", "doc_id": "documents", "chat_id": "chats"}
     for table in TABLES:
@@ -698,17 +904,20 @@ def clone_workspace(template_id, new_id):
         _touch_record(new_id)
         return
     now = datetime.now(timezone.utc).isoformat()
+    generation = uuid4().hex
     with _admin_session() as connection:
         source = connection._run("SELECT id FROM workspaces WHERE id = ? AND ready = 1 FOR SHARE", (template_id,)).fetchone()
         if source is None:
             raise StorageError()
         if connection._run("SELECT id FROM workspaces WHERE id = ?", (new_id,)).fetchone() is not None:
             raise ValueError("This workspace already exists.")
-        created = connection._run("INSERT INTO workspaces(id, created_at, last_active_at, generation, ready) VALUES (?, ?, ?, ?, 1) ON CONFLICT(id) DO NOTHING RETURNING id", (new_id, now, now, uuid4().hex)).fetchone()
+        created = connection._run("INSERT INTO workspaces(id, created_at, last_active_at, generation, ready) VALUES (?, ?, ?, ?, 1) ON CONFLICT(id) DO NOTHING RETURNING id", (new_id, now, now, generation)).fetchone()
         if created is None:
             raise ValueError("This workspace already exists.")
         _clone_rows(connection, template_id, new_id)
     invalidate_vectors(new_id)
+    forget_workspace(new_id)
+    _remember_workspace({"id": new_id, "generation": generation})
 
 
 def reset_workspace(workspace_id):
@@ -720,13 +929,16 @@ def reset_workspace(workspace_id):
         return
     from .workspaces import ensure_template
     ensure_template()
+    generation = uuid4().hex
     with _admin_session() as connection:
         connection._run("SELECT id FROM workspaces WHERE id = ? FOR UPDATE", (workspace_id,))
         _clear_rows(connection, workspace_id)
         _clone_rows(connection, "demo-template", workspace_id)
         connection._run("UPDATE workspaces SET generation = ?, last_active_at = ? WHERE id = ?",
-                        (uuid4().hex, datetime.now(timezone.utc).isoformat(), workspace_id))
+                        (generation, datetime.now(timezone.utc).isoformat(), workspace_id))
     invalidate_vectors(workspace_id)
+    forget_workspace(workspace_id)
+    _remember_workspace({"id": workspace_id, "generation": generation})
 
 
 def delete_workspace(workspace_id):
@@ -736,14 +948,18 @@ def delete_workspace(workspace_id):
         storage = get_storage()
         with _admin_session() as connection:
             connection._run("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+            connection.dirty_workspaces.add(workspace_id)
         with _workspace_connection() as connection:
             connection._run("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+            connection.dirty_workspaces.add(workspace_id)
         with file_lock(storage.root.parent / (workspace_id + ".lock")):
             _remove_tree(storage.root, storage.root.parent)
     else:
         with _workspace_connection() as connection:
             connection._run("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+            connection.dirty_workspaces.add(workspace_id)
     invalidate_vectors(workspace_id)
+    forget_workspace(workspace_id)
 
 
 def cleanup_inactive_workspaces(now=None, exclude=()):
@@ -775,8 +991,10 @@ def cleanup_inactive_workspaces(now=None, exclude=()):
                 result = connection._run("DELETE FROM workspaces WHERE id = ? AND last_active_at < ? RETURNING id", (row["id"], cutoff)).fetchone()
                 if result:
                     removed.append(row["id"])
+                    connection.dirty_workspaces.add(row["id"])
         for workspace_id in removed:
             invalidate_vectors(workspace_id)
+            forget_workspace(workspace_id)
         _LAST_RETENTION = time.monotonic()
         return removed
 
@@ -805,6 +1023,8 @@ def rebind_sqlite_workspace(path, workspace_id):
     finally:
         raw.close()
     invalidate_vectors(workspace_id)
+    from .jobs import bump_data_version
+    bump_data_version(workspace_id)
 
 
 def _import_legacy_usage(raw):
@@ -835,3 +1055,7 @@ def _import_legacy_usage(raw):
 def touch_workspace(workspace_id, now=None):
     _require_workspace(workspace_id)
     _touch_record(workspace_id, now)
+
+
+if perf.ENABLED:
+    perf.install_db(globals())

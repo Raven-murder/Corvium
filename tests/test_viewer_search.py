@@ -42,10 +42,7 @@ class ViewerSearchTests(unittest.TestCase):
                 connection.execute("INSERT INTO chunks(doc_id, page, section, text, embedding) VALUES (?, ?, ?, ?, ?)",
                                    (doc_id, page, section, text, db.embedding_to_blob(vector)))
             if contents is not None:
-                path = self.root / "files" / name
-                path.parent.mkdir(exist_ok=True)
-                path.write_bytes(contents)
-                connection.execute("UPDATE documents SET stored_path = ? WHERE id = ?", (str(path.relative_to(self.root)), doc_id))
+                db.put_file(connection, doc_id, name, contents)
         return doc_id
 
     def chunk(self, text, page=1, section=None, axis=0):
@@ -165,25 +162,26 @@ class ViewerSearchTests(unittest.TestCase):
             self.assertEqual(render.call_count, 1)
             with Image.open(BytesIO(first["png"])) as image:
                 self.assertEqual(image.size, (160, 80))
-            (self.root / "files" / "scan.pdf").write_bytes(pdf_bytes(width=120))
+            with db.database_session(write=True) as connection:
+                db.put_file(connection, doc_id, "scan.pdf", pdf_bytes(width=120))
             self.assertNotEqual(viewer.render_pdf_page(doc_id, 1)["png"], first["png"])
             self.assertEqual(render.call_count, 2)
             with workspaces.storage_context(self.root / "other"):
                 other_id = self.document_in_current_workspace("scan.pdf", pdf_bytes())
                 viewer.render_pdf_page(other_id, 1)
             self.assertEqual(render.call_count, 3)
-            (self.root / "files" / "scan.pdf").unlink()
+            with db.database_session(write=True) as connection:
+                connection.execute("DELETE FROM files WHERE doc_id = ?", (doc_id,))
+            self.assertIsNone(db.get_file_bytes(db.current_workspace_id(), doc_id))
             self.assertIsNone(viewer.render_pdf_page(doc_id, 1))
         self.assertEqual(first["page_count"], 2)
 
     def document_in_current_workspace(self, name, contents):
-        root = workspaces.get_storage().root
-        path = root / "files" / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(contents)
         with db.database_session(write=True) as connection:
-            return connection.execute("INSERT INTO documents(name, uploaded_at, n_chunks, stored_path) VALUES (?, '2026-10-28', 0, ?)",
-                                      (name, str(path.relative_to(root)))).lastrowid
+            doc_id = connection.execute("INSERT INTO documents(name, uploaded_at, n_chunks) VALUES (?, '2026-10-28', 0)",
+                                        (name,)).lastrowid
+            db.put_file(connection, doc_id, name, contents)
+        return doc_id
 
     def test_docx_pptx_html_use_stored_text_when_original_is_missing(self):
         for name, section, text, expected in (
@@ -220,7 +218,9 @@ class ViewerSearchTests(unittest.TestCase):
             image.save(output, format="PNG")
         doc_id = self.document("scan.png", chunks=[self.chunk("OCR text from a scan.")], contents=output.getvalue())
         self.assertEqual(viewer.image_original(doc_id), output.getvalue())
-        (self.root / "files" / "scan.png").unlink()
+        with db.database_session(write=True) as connection:
+            connection.execute("DELETE FROM files WHERE doc_id = ?", (doc_id,))
+        self.assertIsNone(db.get_file_bytes(db.current_workspace_id(), doc_id))
         self.assertIsNone(viewer.image_original(doc_id))
         self.assertEqual(viewer.load_document(doc_id)["parts"][0]["text"], "OCR text from a scan.")
 

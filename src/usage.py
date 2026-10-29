@@ -14,7 +14,7 @@ class UsageLimitError(RuntimeError):
 
 
 def _reserve(kind, workspace_id, limit, now):
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     import hashlib
     if __package__:
         from . import db
@@ -22,8 +22,9 @@ def _reserve(kind, workspace_id, limit, now):
         import db
 
     timestamp = time.time() if now is None else now
-    cutoff = datetime.fromtimestamp(timestamp - 86400, timezone.utc).isoformat()
-    created = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    instant = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=timestamp)
+    cutoff = (instant - timedelta(days=1)).isoformat()
+    created = instant.isoformat()
     if workspace_id is not None and db.backend() == "sqlite":
         db._make_workspace(workspace_id)
     with db._workspace_connection() as connection:

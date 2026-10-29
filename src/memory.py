@@ -6,10 +6,12 @@ import json
 import numpy as np
 
 if __package__:
+    from .read_cache import cached_list
     from .config import get_client
     from .db import connect, init_db, embedding_from_blob, embedding_to_blob
     from .ingest import embed_texts
 else:
+    from read_cache import cached_list
     from config import get_client
     from db import connect, init_db, embedding_from_blob, embedding_to_blob
     from ingest import embed_texts
@@ -107,6 +109,7 @@ def save_memories(items):
     return saved
 
 
+@cached_list
 def list_memories():
     init_db()
     connection = connect()

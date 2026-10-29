@@ -73,7 +73,7 @@ class OCRRobustnessTests(unittest.TestCase):
             with db.database_session() as connection:
                 document = connection.execute("SELECT * FROM documents").fetchone()
                 self.assertEqual(document["status"], "no text found")
-                self.assertEqual((Path(temp) / document["stored_path"]).read_bytes(), self.image)
+                self.assertEqual(db.get_file_bytes(db.current_workspace_id(), document["id"]), self.image)
 
 
 if __name__ == "__main__":

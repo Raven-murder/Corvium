@@ -19,14 +19,12 @@ class SourceTests(unittest.TestCase):
         db.init_db()
 
     def document(self, name, display_name, section=None, text="A complete source sentence.", page=1):
-        path = self.folder / "files" / name
-        path.parent.mkdir(exist_ok=True)
-        path.write_bytes(b"Original file contents")
         with db.database_session(write=True) as connection:
             document_id = connection.execute(
-                "INSERT INTO documents(name, display_name, uploaded_at, n_chunks, stored_path) VALUES (?, ?, '2026-10-28', 1, ?)",
-                (name, display_name, str(path)),
+                "INSERT INTO documents(name, display_name, uploaded_at, n_chunks) VALUES (?, ?, '2026-10-28', 1)",
+                (name, display_name),
             ).lastrowid
+            db.put_file(connection, document_id, name, b"Original file contents")
             connection.execute(
                 "INSERT INTO chunks(doc_id, page, text, embedding, section) VALUES (?, ?, ?, ?, ?)",
                 (document_id, page, text, b"fixture-vector", section),
@@ -80,13 +78,15 @@ class SourceTests(unittest.TestCase):
     def test_missing_originals_and_deleted_documents_have_no_download(self):
         source = self.document("notes.md", "Notes")
         group = sources.group_answer_sources([source], "Answer [Notes, p.1]")[0]
-        Path(group["stored_path"]).unlink()
+        with db.database_session(write=True) as connection:
+            connection.execute("DELETE FROM files WHERE doc_id = ?", (source["doc_id"],))
+        self.assertIsNone(db.get_file_bytes(db.current_workspace_id(), source["doc_id"]))
         self.assertIsNone(sources.original_download(group))
-        self.assertIsNone(sources.original_download({"stored_path": None}))
+        self.assertIsNone(sources.original_download({}))
         with db.database_session(write=True) as connection:
             connection.execute("DELETE FROM documents WHERE id = ?", (source["doc_id"],))
         group = sources.group_answer_sources([source], "Answer [Notes, p.1]")[0]
-        self.assertIsNone(group["stored_path"])
+        self.assertIsNone(group["doc_id"])
         self.assertEqual(group["passages"][0]["text"], source["text"])
 
     def test_legacy_sources_without_ids_resolve_original_filename(self):
@@ -101,14 +101,16 @@ class SourceTests(unittest.TestCase):
     def test_sources_buttons_open_one_docked_panel_and_hide_missing_downloads(self):
         source = self.document("notes.pdf", "Notes")
         missing = self.document("missing.md", "Missing")
-        (self.folder / "files" / "missing.md").unlink()
+        with db.database_session(write=True) as connection:
+            connection.execute("DELETE FROM files WHERE doc_id = ?", (missing["doc_id"],))
         tree = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
         nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
                  and node.name in {"show_sources", "show_sources_panel", "show_source_groups"}]
         ui = MagicMock()
         ui.session_state = {"selected_chat_id": 1}
         ui.columns.side_effect = lambda widths: [ui] * len(widths)
-        namespace = {"st": ui, "group_answer_sources": sources.group_answer_sources,
+        namespace = {"st": ui, "has_answer_sources": sources.has_answer_sources,
+                     "group_answer_sources": sources.group_answer_sources,
                      "original_download": sources.original_download, "run_callback": Mock(),
                      "open_sources_panel": sources.open_sources_panel, "active_sources_panel": sources.active_sources_panel,
                      "sources_panel_dock": sources.sources_panel_dock, "dock_sources_panel": sources.dock_sources_panel,

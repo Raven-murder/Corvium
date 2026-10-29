@@ -3,7 +3,7 @@ from threading import Event, Lock, RLock, Thread
 import time
 from uuid import uuid4
 
-from . import config
+from . import config, perf
 from .chats import add_message, get_message, list_messages
 from .diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
 from .qa import answer_question
@@ -12,6 +12,8 @@ from .workspaces import database_identity, validate_workspace_id, workspace_cont
 
 MAX_SECONDS = 180
 RETENTION_SECONDS = 600
+_VERSION_LOCK = RLock()
+_DATA_VERSIONS = {}
 
 
 class JobBusyError(RuntimeError):
@@ -81,7 +83,7 @@ class JobManager:
                        "diagram" if diagram_parameters is not None or diagram_request_kind(question) else "answer",
                        message_id, message["created_at"], identity, language)
             self.jobs[job.id] = job
-            worker = Thread(target=self._run, args=(job, question, history, parameters, settings), daemon=True)
+            worker = Thread(target=perf.worker(self._run) if perf.ENABLED else self._run, args=(job, question, history, parameters, settings), daemon=True)
             self.workers[workspace_id] = worker
             try:
                 worker.start()
@@ -227,15 +229,23 @@ class JobManager:
         )} | {"cancel_requested": job.cancel_flag.is_set()}
 
     def latest(self, workspace_id, chat_id=None, *, running_only=False):
+        from . import db
         workspace_id = validate_workspace_id(workspace_id)
-        try:
-            identity = database_identity(workspace_storage(workspace_id))
-        except OSError:
-            return None
         with self.lock:
-            matches = [job for job in self.jobs.values() if job.workspace_id == workspace_id
-                       and (chat_id is None or job.chat_id == chat_id) and job.database == identity
-                       and (not running_only or job.status == "running" or not job.finalized)]
+            candidates = [job for job in self.jobs.values() if job.workspace_id == workspace_id
+                          and (chat_id is None or job.chat_id == chat_id)
+                          and (not running_only or job.status == "running" or not job.finalized)]
+        if not candidates:
+            return None
+        if db.backend() == "postgres":
+            identity = db.known_workspace_identity(workspace_id)
+        else:
+            try:
+                identity = database_identity(workspace_storage(workspace_id))
+            except OSError:
+                return None
+        with self.lock:
+            matches = [job for job in candidates if identity is None or job.database == identity]
             return self._snapshot(max(matches, key=lambda job: job.started)) if matches else None
 
     def cancel(self, workspace_id, chat_id, job_id):
@@ -266,3 +276,14 @@ def cancel_job(workspace_id, chat_id, job_id):
 
 def running_job(workspace_id):
     return _MANAGER.latest(workspace_id, running_only=True)
+
+
+def data_version(workspace_id):
+    with _VERSION_LOCK:
+        return _DATA_VERSIONS.get(workspace_id, 0)
+
+
+def bump_data_version(workspace_id):
+    if workspace_id is not None:
+        with _VERSION_LOCK:
+            _DATA_VERSIONS[workspace_id] = _DATA_VERSIONS.get(workspace_id, 0) + 1

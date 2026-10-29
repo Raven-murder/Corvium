@@ -168,3 +168,12 @@ def safe_error(error):
     if key:
         message = message.replace(key, "[REDACTED]")
     return message if getattr(error, "public_message", False) else f"{type(error).__name__}: {message}"
+
+
+if __package__:
+    from . import perf
+else:
+    import perf
+
+if perf.ENABLED:
+    OpenAI = perf.client_factory(OpenAI)

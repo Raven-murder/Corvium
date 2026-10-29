@@ -119,9 +119,7 @@ class IngestionTests(unittest.TestCase):
         path.write_bytes(b"# Atomicity\nCommit both updates.\n# Recovery\nRoll back together.")
         self.assertEqual(ingest.ingest_file(path), 2)
         document = self.document(path.name)
-        stored = self.folder / "files" / f"{document['id']}.md"
-        self.assertEqual(stored.read_bytes(), path.read_bytes())
-        self.assertEqual((self.folder / document["stored_path"]).resolve(), stored.resolve())
+        self.assertEqual(db.get_file_bytes(db.current_workspace_id(), document["id"]), path.read_bytes())
         self.assertEqual(document["kind"], "text")
         self.assertEqual(document["status"], "indexed")
         with db.database_session() as connection:
@@ -137,7 +135,7 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(document["kind"], "image")
         self.assertIn("no text found", document["status"])
         self.assertIn("OCR not configured", document["status"])
-        self.assertEqual((self.folder / document["stored_path"]).read_bytes(), path.read_bytes())
+        self.assertEqual(db.get_file_bytes(db.current_workspace_id(), document["id"]), path.read_bytes())
         self.embed.assert_not_called()
         empty = self.folder / "empty.txt"
         empty.write_bytes(b"")
@@ -176,12 +174,11 @@ class IngestionTests(unittest.TestCase):
         ingest.ingest_file(path)
         document = self.document(path.name)
         path.write_bytes(b"Changed version")
-        with patch.object(Path, "replace", side_effect=OSError("Cannot save file")):
-            with self.assertRaises(OSError):
+        with patch.object(ingest, "put_file", side_effect=db.StorageError()):
+            with self.assertRaises(db.StorageError):
                 ingest.ingest_file(path)
         self.assertEqual(self.document(path.name), document)
-        self.assertEqual((self.folder / document["stored_path"]).read_bytes(), b"First version")
-        self.assertEqual(list((self.folder / "files").glob("ingest-*")), [])
+        self.assertEqual(db.get_file_bytes(db.current_workspace_id(), document["id"]), b"First version")
         with db.database_session() as connection:
             self.assertEqual(connection.execute("SELECT text FROM chunks").fetchone()[0], "First version")
 

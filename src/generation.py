@@ -1,3 +1,10 @@
+if __package__:
+    from . import perf
+else:
+    import perf
+
+
+@perf.operation("nebius.stream_completion")
 def stream_completion(client, *, on_chunk, check_cancel, **parameters):
     if check_cancel is None:
         check_cancel = lambda: None

@@ -1,5 +1,11 @@
 """Run with: streamlit run app.py"""
 
+from src import perf
+
+if perf.ENABLED and __name__ == "__main__":
+    perf.begin_script()
+
+from src import db
 from contextlib import nullcontext
 
 import streamlit as st
@@ -14,7 +20,7 @@ from src.plans import list_plans
 from src.diagrams import parse_diagram_message, render_diagram_png, diagram_outline, diagram_caption, DiagramRenderError, list_saved_diagrams
 from src.sources import (
     group_answer_sources, original_download, open_sources_panel, active_sources_panel,
-    dock_sources_panel, sources_panel_dock, close_sources_panel,
+    dock_sources_panel, sources_panel_dock, close_sources_panel, has_answer_sources,
 )
 from src import workflows as flow
 from src import viewer as doc_viewer
@@ -24,6 +30,8 @@ from src.branding import load_logo, DEFAULT_ICON
 from src.workspaces import bind_workspace, get_storage
 
 
+@perf.callback
+@db.read_callback
 def run_callback(action, *args):
     try:
         _, unchanged = bind_workspace(st.query_params, st.session_state)
@@ -35,6 +43,8 @@ def run_callback(action, *args):
 
 
 @st.dialog("Confirm deletion", dismissible=False)
+@perf.entry("dialog:show_delete_dialog")
+@db.read_entry
 def show_delete_dialog():
     request = st.session_state.get("destructive_confirmation")
     if request is None:
@@ -190,6 +200,8 @@ def show_chat_message(message, chat_id, scope="chat"):
 
 
 @st.fragment(run_every=0.5)
+@perf.entry("fragment:show_live_answer")
+@db.read_entry
 def show_live_answer(workspace_id, chat_id, message_ids):
     if st.query_params.get("w") != workspace_id:
         return
@@ -410,6 +422,8 @@ def dismiss_pinned_message():
 
 
 @st.dialog("Pinned message", width="large", on_dismiss=dismiss_pinned_message)
+@perf.entry("dialog:show_pinned_message_dialog")
+@db.read_entry
 def show_pinned_message_dialog():
     if any(st.session_state.get(key) for key in ("viewer_request", "diagram_view", "sources_panel", "destructive_confirmation")):
         flow.close_pinned_message(st.session_state)
@@ -444,6 +458,8 @@ def dismiss_diagram_view():
 
 
 @st.dialog("Diagram", width="large", on_dismiss=dismiss_diagram_view)
+@perf.entry("dialog:show_diagram_dialog")
+@db.read_entry
 def show_diagram_dialog():
     diagram = flow.active_diagram_view(st.session_state)
     if diagram is None:
@@ -503,7 +519,7 @@ def show_source_groups(groups, message_key):
 
 
 def show_sources(sources, answer, message_key):
-    if not group_answer_sources(sources, answer):
+    if not has_answer_sources(sources, answer):
         return
     st.button(
         "Sources", icon=":material/menu_book:", type="tertiary", width="content", key=f"answer_sources_{message_key}",
@@ -546,6 +562,8 @@ def show_viewer_parts(data, locator):
 
 
 @st.dialog("Document", width="large", on_dismiss=dismiss_document_viewer)
+@perf.entry("dialog:show_document_viewer")
+@db.read_entry
 def show_document_viewer():
     request = doc_viewer.active_viewer(st.session_state)
     if request is None:
@@ -852,22 +870,25 @@ def render_section(section, documents, memories, library, demo_results=(), in_di
     shell = nullcontext() if in_dialog else st.expander(label, icon=f":material/{icon}:", expanded=st.session_state.get("open_section") == section,
                                                       key=key, on_change="rerun")
     with shell:
+        if not in_dialog and not shell.open:
+            return None
         if not in_dialog and st.session_state.get("rail_dialog") == section:
             st.caption("This section is open in a dialog.")
             return None
         if section == "tools":
-            return show_actions_panel(documents, memories)
+            return show_actions_panel(list_documents() if documents is None else documents,
+                                      list_memories() if memories is None else memories)
         if section == "library":
             for result in demo_results:
                 if result["error"] or result["status"] != "indexed":
                     st.warning(f"{result['name']}: {result['error'] or result['status']}")
-            show_library_panel(library)
+            show_library_panel(list_library() if library is None else library)
         elif section == "search":
             show_search_panel()
         elif section == "bookmarks":
             show_bookmarks_panel()
         elif section == "memory":
-            show_memory_panel(memories)
+            show_memory_panel(list_memories() if memories is None else memories)
         elif section == "tips":
             show_tips()
         elif section == "pinned":
@@ -907,6 +928,8 @@ def dismiss_section_dialog():
 
 
 @st.dialog("Section", width="large", on_dismiss=dismiss_section_dialog)
+@perf.entry("dialog:show_section_dialog")
+@db.read_entry
 def show_section_dialog():
     section = st.session_state.get("rail_dialog")
     if section not in navigation.SECTIONS or any(st.session_state.get(key) for key in (
@@ -914,7 +937,7 @@ def show_section_dialog():
         st.rerun()
         return
     st.subheader(navigation.SECTIONS[section][0])
-    pending = render_section(section, list_documents(), list_memories(), list_library(), in_dialog=True)
+    pending = render_section(section, None, None, None, in_dialog=True)
     if pending:
         st.session_state["pending_tool"] = pending
         navigation.close_dialog(st.session_state)
@@ -930,11 +953,10 @@ def main():
     st.markdown(themes.styles(theme, accent), unsafe_allow_html=True)
     try:
         with st.spinner("Preparing your library…"):
-            demo_results = flow.initialize_library()
+            workspace = flow.initialize_render(st.session_state)
         st.session_state.setdefault("processed_files", {})
-        documents = list_documents()
-        memories = list_memories()
-        library = list_library()
+        demo_results = workspace.get("demo_results", [])
+        documents = memories = library = None
     except Exception as error:
         st.error(safe_error(error))
         st.stop()
@@ -999,7 +1021,7 @@ def main():
     except Exception as error:
         st.error(safe_error(error))
         st.stop()
-    question = st.chat_input("Ask about your notes", key="chat_prompt", disabled=not documents) or starter_question
+    question = st.chat_input("Ask about your notes", key="chat_prompt", disabled=not workspace["has_documents"]) or starter_question
     if question:
         try:
             flow.submit_answer_job(st.session_state, question)
@@ -1021,8 +1043,14 @@ def main():
 
 
 if __name__ == "__main__":
+    if perf.ENABLED:
+        perf.install_app(globals())
     try:
-        main()
+        with db.rerun_reads():
+            main()
     except StorageError as error:
         st.error(safe_error(error))
         st.stop()
+    finally:
+        if perf.ENABLED:
+            perf.finish_script()

@@ -1,3 +1,4 @@
+from .read_cache import cached_list
 from datetime import datetime, timezone
 import json
 
@@ -38,6 +39,7 @@ def create_plan(title, body, days):
         ).fetchone()["id"]
 
 
+@cached_list
 def list_plans():
     with database_session() as connection:
         return [_record(row) for row in connection.execute(

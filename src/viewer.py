@@ -5,6 +5,7 @@ import re
 import streamlit as st
 from pypdf import PdfReader
 
+from . import perf
 from .db import database_session, current_workspace_id, get_file_bytes
 from .extractors import extract_docx, extract_pptx, extract_html, extract_text
 from .workspaces import get_storage
@@ -128,6 +129,7 @@ def selected_part_index(data, locator):
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
+@perf.operation("pypdfium2.render_and_encode")
 def _cached_pdf_page(workspace, doc_id, page, version, _contents):
     import pypdfium2 as pdfium
 

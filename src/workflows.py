@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from threading import RLock
 
 from .config import safe_error
 from .workspaces import get_storage, ensure_workspace, cleanup_workspaces
@@ -629,3 +630,34 @@ def open_rail_section(state, section):
     elif section == "study_plan":
         open_plan_view(state)
     request_section(state, section)
+
+
+_SESSION_SETUP_LOCK = RLock()
+
+
+def initialize_render(state):
+    from . import db
+    if db.backend() == "sqlite":
+        results = initialize_library()
+        return {"has_documents": bool(list_documents()), "demo_results": results}
+    storage = get_storage()
+    if db.initialization_needed():
+        db.init_db()
+    row = db._workspace_info(storage.workspace_id)
+    if row is None or state.get("_workspace_ready") != storage.workspace_id:
+        scope = db._read_scope()
+        if scope is not None:
+            scope.close()
+        with _SESSION_SETUP_LOCK:
+            if row is None:
+                from .workspaces import forget_prepared_workspace
+                forget_prepared_workspace(storage.workspace_id)
+            ensure_workspace(storage)
+            state["_workspace_ready"] = storage.workspace_id
+            if row is None:
+                db.forget_workspace(storage.workspace_id)
+                row = db._workspace_info(storage.workspace_id)
+    if row is None:
+        raise db.StorageError()
+    cleanup_workspaces(exclude=(storage.workspace_id,))
+    return row

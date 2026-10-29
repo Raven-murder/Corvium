@@ -11,6 +11,7 @@ import numpy as np
 from pypdf import PdfReader
 
 if __package__:
+    from . import perf
     from .config import EMBED_MODEL, PROJECT_ROOT, get_client, get_vision_model, safe_error, StorageError
     from .db import connect, embedding_from_blob, embedding_to_blob, init_db, infer_document_kind, normalize_document_ids, database_session, put_file, check_upload_guard, check_upload_capacity, cached_chunks
     from .extractors import extract_docx, extract_pptx, extract_html, extract_text
@@ -18,6 +19,7 @@ if __package__:
     from .workspaces import get_storage, WorkspaceError
     from .usage import reserve_workspace_action, UsageLimitError
 else:
+    import perf
     from config import EMBED_MODEL, PROJECT_ROOT, get_client, get_vision_model, safe_error, StorageError
     from db import connect, embedding_from_blob, embedding_to_blob, init_db, infer_document_kind, normalize_document_ids, database_session, put_file, check_upload_guard, check_upload_capacity, cached_chunks
     from extractors import extract_docx, extract_pptx, extract_html, extract_text
@@ -45,6 +47,7 @@ def _read_file(path):
     return contents
 
 
+@perf.operation("pypdfium2.ingest_render_and_encode")
 def _render_pdf_page(contents, index):
     import pypdfium2 as pdfium
 

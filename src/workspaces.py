@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+from threading import RLock
 from uuid import uuid4
 
 if not __package__:
@@ -21,6 +22,9 @@ else:
 
 _STORAGE = ContextVar("workspace_storage", default=None)
 _DATABASE_IDENTITY = ContextVar("workspace_database_identity", default=None)
+_PREPARE_LOCK = RLock()
+_READY_WORKSPACES = set()
+_TEMPLATE_READY = False
 _ID = re.compile(r"[0-9a-f]{32}")
 
 
@@ -193,21 +197,27 @@ def ensure_template():
     from . import db, demo
 
     if db.backend() == "postgres":
-        db.init_db()
-        with db.template_lock():
-            record = db._workspace_info("demo-template")
-            if record is not None and record["ready"]:
+        global _TEMPLATE_READY
+        with _PREPARE_LOCK:
+            if _TEMPLATE_READY:
                 return "demo-template"
-            db._make_workspace("demo-template", ready=0)
-            with db._admin_session() as connection:
-                db._clear_rows(connection, "demo-template")
-            with _template_context(config.DATA_DIR / "demo_template"):
-                results = demo._seed_demo_files() or []
-                if any(result["error"] for result in results):
-                    raise WorkspaceError("The demo could not be prepared. Please try again later.")
-            with db._admin_session() as connection:
-                connection._run("UPDATE workspaces SET ready = 1 WHERE id = ?", ("demo-template",))
-        return "demo-template"
+            if db.initialization_needed():
+                db.init_db()
+            with db.template_lock():
+                record = db._workspace_info("demo-template")
+                if record is None or not record["ready"]:
+                    db._make_workspace("demo-template", ready=0)
+                    with db._admin_session() as connection:
+                        db._clear_rows(connection, "demo-template")
+                    with _template_context(config.DATA_DIR / "demo_template"):
+                        results = demo._seed_demo_files() or []
+                        if any(result["error"] for result in results):
+                            raise WorkspaceError("The demo could not be prepared. Please try again later.")
+                    with db._admin_session() as connection:
+                        connection._run("UPDATE workspaces SET ready = 1 WHERE id = ?", ("demo-template",))
+                    db.forget_workspace("demo-template")
+            _TEMPLATE_READY = True
+            return "demo-template"
     template = template_directory()
     with file_lock(config.DATA_DIR / "demo_template.lock"):
         if (template / ".ready").is_file() and (template / "app.db").is_file():
@@ -266,15 +276,20 @@ def ensure_workspace(storage):
     if storage != expected:
         raise WorkspaceError("This workspace is unavailable. Please refresh the page.")
     if db.backend() == "postgres":
-        db.init_db()
-        if db._workspace_info(storage.workspace_id) is None:
-            ensure_template()
-            try:
-                db.clone_workspace("demo-template", storage.workspace_id)
-            except ValueError:
-                if db._workspace_info(storage.workspace_id) is None:
-                    raise
-        _touch(storage)
+        with _PREPARE_LOCK:
+            if storage.workspace_id in _READY_WORKSPACES:
+                return
+            if db.initialization_needed():
+                db.init_db()
+            if db._workspace_info(storage.workspace_id) is None:
+                ensure_template()
+                try:
+                    db.clone_workspace("demo-template", storage.workspace_id)
+                except ValueError:
+                    db.forget_workspace(storage.workspace_id)
+                    if db._workspace_info(storage.workspace_id) is None:
+                        raise
+            _READY_WORKSPACES.add(storage.workspace_id)
         return
     template = ensure_template() if not storage.db_path.is_file() else None
     with file_lock(storage.root.parent / (storage.workspace_id + ".lock")):
@@ -340,3 +355,8 @@ def resolve_original_path(stored_path):
     if not resolved.is_relative_to(storage.files_dir.resolve()):
         return None
     return resolved
+
+
+def forget_prepared_workspace(workspace_id):
+    with _PREPARE_LOCK:
+        _READY_WORKSPACES.discard(workspace_id)

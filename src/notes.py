@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import re
 
 from .db import database_session
+from .read_cache import cached_list
 
 MAX_NOTES = 500
 MAX_BOOKMARKS = 500
@@ -78,16 +79,20 @@ def delete_note(note_id):
         connection.execute("DELETE FROM notes WHERE id = ?", (note_id,))
 
 
-def list_notes(query=""):
-    if not isinstance(query, str):
-        raise NotesError("Enter text to filter notes.")
+@cached_list
+def _all_notes():
     with database_session() as connection:
-        rows = [dict(row) for row in connection.execute(
+        return [dict(row) for row in connection.execute(
             "SELECT n.*, d.display_name AS doc_name FROM notes n LEFT JOIN documents d ON d.id = n.doc_id "
             "ORDER BY n.pinned DESC, n.updated_at DESC, n.id DESC"
         )]
+
+
+def list_notes(query=""):
+    if not isinstance(query, str):
+        raise NotesError("Enter text to filter notes.")
     query = query.strip().casefold()
-    return [row for row in rows if not query or query in (row["title"] + "\n" + row["body"]).casefold()]
+    return [row for row in _all_notes() if not query or query in (row["title"] + "\n" + row["body"]).casefold()]
 
 
 def pin_note(note_id, pinned=True):
@@ -164,17 +169,20 @@ def delete_bookmark(bookmark_id):
         connection.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
 
 
-def list_bookmarks(doc_id=None):
+@cached_list
+def _all_bookmarks():
     with database_session() as connection:
-        if doc_id is not None:
-            _document(connection, doc_id)
         return [dict(row) for row in connection.execute(
             "SELECT b.*, d.display_name AS doc_name, d.kind AS doc_kind FROM bookmarks b "
-            "JOIN documents d ON d.id = b.doc_id "
-            + ("WHERE b.doc_id = ? " if doc_id is not None else "")
-            + "ORDER BY lower(d.display_name), d.id, b.created_at, b.id",
-            (doc_id,) if doc_id is not None else (),
+            "JOIN documents d ON d.id = b.doc_id ORDER BY lower(d.display_name), d.id, b.created_at, b.id"
         )]
+
+
+def list_bookmarks(doc_id=None):
+    if doc_id is not None:
+        with database_session() as connection:
+            _document(connection, doc_id)
+    return [row for row in _all_bookmarks() if doc_id is None or row["doc_id"] == doc_id]
 
 
 def current_bookmark(doc_id, locator):

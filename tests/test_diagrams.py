@@ -121,7 +121,7 @@ class DiagramGenerationTests(unittest.TestCase):
         self.complete = Mock(return_value=response(FLOWCHART))
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.complete)))
         for name, value in (('get_client', client), ('search', [SOURCE]),
-                            ('diagram_language', 'json'), ('reserve_workspace_action', None)):
+                            ('reserve_workspace_action', None)):
             mock = patch.object(diagrams, name, return_value=value)
             setattr(self, name, mock.start())
             self.addCleanup(mock.stop)
@@ -147,8 +147,8 @@ class DiagramGenerationTests(unittest.TestCase):
         self.assertEqual(self.complete.call_count, 2)
         self.assertIn('25 nodes', self.complete.call_args.kwargs['messages'][1]['content'])
 
-    def test_bad_header_empty_and_truncated_responses_fail_after_one_retry(self):
-        for invalid in (response('pie\n Commit: 1'), response(''), response(FLOWCHART, 'length')):
+    def test_invalid_json_empty_and_truncated_responses_fail_after_one_retry(self):
+        for invalid in (response(json.dumps({'type': 'pie', 'title': 'Transactions'})), response(''), response(FLOWCHART, 'length')):
             with self.subTest(invalid=invalid):
                 self.complete.reset_mock(side_effect=True)
                 self.complete.return_value = invalid

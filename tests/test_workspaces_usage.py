@@ -2,18 +2,18 @@ import ast
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import importlib.util
-import os
+import re
 from pathlib import Path
 import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 
 with patch("dotenv.load_dotenv"):
-    from src import actions, chats, config, db, demo, ingest, library, memory, qa, sources, usage, workspaces
+    from src import actions, chats, config, db, demo, ingest, library, memory, perf, qa, sources, usage, workflows, workspaces
 
 A = "a" * 32
 B = "b" * 32
@@ -81,7 +81,8 @@ class WorkspaceTests(unittest.TestCase):
         node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_callback")
         state = {"workspace_id": A, "destructive_confirmation": {"item": 1}}
         ui = SimpleNamespace(query_params={"w": B}, session_state=state)
-        namespace = {"st": ui, "bind_workspace": workspaces.bind_workspace, "safe_error": str}
+        namespace = {"st": ui, "perf": perf, "db": db,
+                     "bind_workspace": workspaces.bind_workspace, "safe_error": str}
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<workspace-callback>", "exec"), namespace)
         action = Mock()
         namespace["run_callback"](action, 1)
@@ -113,7 +114,7 @@ class WorkspaceTests(unittest.TestCase):
             chats.add_message(chat_a, "user", "Private A message")
             library.create_folder("Private A folder")
             original = next(row for row in library.list_documents() if row["name"] == path.name)
-            original_path = workspaces.resolve_original_path(original["stored_path"])
+            self.assertEqual(db.get_file_bytes(A, original["id"]), b"Private A content.")
         with self.context(B):
             self.assertNotIn("private-a.md", [row["name"] for row in library.list_documents()])
             self.assertNotIn("Private A memory", [row["text"] for row in memory.list_memories()])
@@ -122,7 +123,10 @@ class WorkspaceTests(unittest.TestCase):
             chat_b = chats.create_chat("Private B chat")
             chats.add_message(chat_b, "user", "Private B message")
             self.assertEqual([row["content"] for row in chats.list_messages(chat_b)], ["Private B message"])
-            self.assertIsNone(sources.original_download({"stored_path": str(original_path), "name": "private-a.md"}))
+            with self.assertRaises(ValueError):
+                db.get_file_bytes(A, original["id"])
+            self.assertIsNone(db.get_file_bytes(B, original["id"]))
+            self.assertIsNone(sources.original_download({"doc_id": original["id"], "name": "private-a.md"}))
             with self.assertRaises(workspaces.WorkspaceError):
                 ingest.ingest_file(path)
         with self.context(A):
@@ -138,8 +142,7 @@ class WorkspaceTests(unittest.TestCase):
             memories_embedded = self.memory_embed.call_count
             with self.context(A):
                 document = library.list_documents()[0]
-                self.assertFalse(Path(document["stored_path"]).is_absolute())
-                self.assertTrue(workspaces.resolve_original_path(document["stored_path"]).is_file())
+                self.assertEqual(db.get_file_bytes(A, document["id"]), (self.root / "demo_data" / "sample.md").read_bytes())
             with self.context(B):
                 self.assertEqual(len(library.list_documents()), 1)
                 self.assertEqual(len(memory.list_memories()), 2)
@@ -147,6 +150,20 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(self.memory_embed.call_count, memories_embedded)
             seed.assert_called_once()
             self.assertTrue((template / ".ready").is_file())
+        connection = MagicMock(dialect="postgres")
+        connection.dirty_workspaces = set()
+        db._clone_rows(connection, "demo-template", A)
+        statements = [call.args[0] for call in connection._run.call_args_list]
+        for table in db.TABLES:
+            inserts = [sql for sql in statements if re.search(r"\bINSERT INTO " + table + r"\(", sql)]
+            self.assertEqual(len(inserts), 1, table)
+            self.assertIn("SELECT", inserts[0])
+            self.assertIn("scope.source_id", inserts[0])
+            self.assertIn("scope.target_id", inserts[0])
+        self.assertFalse(any(re.search(r"SELECT\s+\*\s+FROM\s+(chunks|files)\b", sql, re.I) for sql in statements))
+        connection._run.return_value.fetchall.assert_not_called()
+        connection._run.return_value.fetchone.assert_not_called()
+        self.assertEqual(connection.dirty_workspaces, {A})
 
     @unittest.skipUnless(importlib.util.find_spec("docx") and importlib.util.find_spec("pptx"), "Office parsers are not installed")
     def test_template_includes_office_files_and_skips_unconfigured_image_ocr(self):
@@ -170,7 +187,8 @@ class WorkspaceTests(unittest.TestCase):
                 self.assertEqual({row["kind"] for row in documents}, {"text", "docx", "pptx", "image"})
                 image = next(row for row in documents if row["kind"] == "image")
                 self.assertIn("OCR not configured", image["status"])
-                self.assertTrue(all(workspaces.resolve_original_path(row["stored_path"]).is_file() for row in documents))
+                for row in documents:
+                    self.assertEqual(db.get_file_bytes(A, row["id"]), (folder / row["name"]).read_bytes())
             ocr.assert_not_called()
 
     def test_simultaneous_first_visitors_publish_one_complete_template(self):
@@ -182,7 +200,32 @@ class WorkspaceTests(unittest.TestCase):
             with self.context(workspace_id):
                 self.assertEqual(len(library.list_documents()), 1)
                 with db.database_session() as connection:
-                    self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                    self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        record = {"id": A, "generation": "fixture", "has_documents": True}
+        with patch.object(db, "backend", return_value="postgres"), \
+                patch.object(db, "initialization_needed", return_value=False), \
+                patch.object(db, "init_db") as initialize, \
+                patch.object(db, "_workspace_info", return_value=record) as snapshot, \
+                patch.object(workspaces, "_READY_WORKSPACES", set()), \
+                patch.object(workspaces, "ensure_template") as template:
+            storage = workspaces.workspace_storage(A)
+            workspaces.ensure_workspace(storage)
+            workspaces.ensure_workspace(storage)
+            snapshot.assert_called_once_with(A)
+            initialize.assert_not_called()
+            template.assert_not_called()
+            snapshot.reset_mock()
+            with patch.object(workflows, "get_storage", return_value=storage), \
+                    patch.object(workflows, "ensure_workspace") as prepare, \
+                    patch.object(workflows, "cleanup_workspaces"), \
+                    patch.object(db, "_read_scope", return_value=None):
+                state = {}
+                self.assertEqual(workflows.initialize_render(state), record)
+                self.assertEqual(workflows.initialize_render(state), record)
+                prepare.assert_called_once_with(storage)
+                self.assertEqual(snapshot.call_count, 2)
+                self.assertEqual(state["_workspace_ready"], A)
+                initialize.assert_not_called()
 
     def test_failed_template_build_is_not_published(self):
         with patch.object(demo, "_seed_demo_files", side_effect=RuntimeError("Build interrupted")):
@@ -213,13 +256,14 @@ class WorkspaceTests(unittest.TestCase):
         with self.context(B):
             self.assertEqual(chats.list_chats()[0]["title"], "Keep B")
 
-    def test_cleanup_removes_only_workspaces_older_than_seven_days(self):
+    def test_cleanup_removes_only_workspaces_older_than_retention_window(self):
         for workspace_id in (A, B):
             workspaces.ensure_workspace(workspaces.workspace_storage(workspace_id))
-        now = 2_000_000
-        for workspace_id, days in ((A, 8), (B, 6)):
-            marker = workspaces.workspace_storage(workspace_id).root / ".last_used"
-            os.utime(marker, (now - days * 86400, now - days * 86400))
+        now = 2_000_000_000
+        retention = config.WORKSPACE_RETENTION_DAYS
+        for workspace_id, days in ((A, retention + 1), (B, max(0, retention - 1))):
+            with self.context(workspace_id):
+                db.touch_workspace(workspace_id, now=now - days * 86400)
         unrelated = self.data / "workspaces" / "not-a-workspace"
         unrelated.mkdir()
         workspaces.cleanup_workspaces(now=now)
@@ -227,7 +271,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(workspaces.workspace_storage(B).root.exists())
         self.assertTrue(workspaces.template_directory().is_dir())
         self.assertTrue(unrelated.exists())
-        workspaces.cleanup_workspaces(now=now + 20 * 86400, exclude=(B,))
+        workspaces.cleanup_workspaces(now=now + (retention + 20) * 86400, exclude=(B,))
         self.assertTrue(workspaces.workspace_storage(B).root.exists())
 
     def test_workspace_categories_and_rolling_windows_are_enforced(self):
@@ -242,7 +286,9 @@ class WorkspaceTests(unittest.TestCase):
                 usage.reserve_workspace_action("chat", now=87400)
             with self.context(B):
                 usage.reserve_workspace_action("chat", now=87400)
-        self.assertTrue((self.data / "usage.db").is_file())
+        with db._workspace_connection() as connection:
+            rows = connection._run("SELECT workspace_id, kind FROM usage_events ORDER BY workspace_id").fetchall()
+        self.assertEqual([(row["workspace_id"], row["kind"]) for row in rows], [(A, "chat"), (B, "chat")])
 
     def test_global_api_limit_is_shared_atomic_and_has_a_private_message(self):
         with patch.object(config, "GLOBAL_API_ACTION_LIMIT", 5):

@@ -54,12 +54,12 @@ class ThemesTests(unittest.TestCase):
                 css = themes.styles(invalid, invalid)
                 self.assertEqual(css, themes.styles())
                 self.assertNotIn("<script>", css)
-        state = {"theme_preset": "midnight", "accent_name": "rose"}
+        state = {"theme_preset": "missing", "accent_name": "unknown"}
         self.assertEqual(themes.initialize_appearance(state, {"t": "bad", "a": "bad"}), ("auto", "blue"))
 
     def test_valid_appearance_round_trip_keeps_workspace_and_other_query_values(self):
         state = {}
-        query = {"w": "b" * 32, "t": "light", "a": "teal", "other": "preserved"}
+        query = {"w": "b" * 32, "t": "light", "a": "green", "other": "preserved"}
         self.assertEqual(themes.initialize_appearance(state, query), ("light", "green"))
         state.update(theme_preset="eye_comfort", accent_name="amber")
         themes.change_appearance(state, query)
@@ -68,6 +68,11 @@ class ThemesTests(unittest.TestCase):
         state.update(theme_preset="invalid", accent_name="invalid")
         themes.change_appearance(state, query)
         self.assertEqual((query["t"], query["a"], query["w"]), ("auto", "blue", "b" * 32))
+        for old_theme, old_accent, expected in (("raven", "indigo", ("dark", "blue")),
+                                                 ("midnight", "teal", ("dark", "green")),
+                                                 ("light", "rose", ("light", "red"))):
+            with self.subTest(theme=old_theme, accent=old_accent):
+                self.assertEqual(themes.initialize_appearance({}, {"t": old_theme, "a": old_accent}), expected)
 
     def test_css_covers_widgets_and_eye_comfort_contains_no_white_text_color(self):
         css = themes.styles("eye_comfort", "amber")
@@ -101,11 +106,11 @@ class ThemesTests(unittest.TestCase):
 class BrandingTests(unittest.TestCase):
     def test_missing_and_unreadable_logo_return_none(self):
         with tempfile.TemporaryDirectory() as temporary:
-            self.assertIsNone(branding.load_logo("raven", temporary))
+            self.assertIsNone(branding.load_logo("dark", temporary))
             self.assertIsNone(branding.load_logo("light", temporary))
             path = Path(temporary) / "raven.png"
             path.write_bytes(b"invalid image data")
-            self.assertIsNone(branding.load_logo("raven", temporary))
+            self.assertIsNone(branding.load_logo("dark", temporary))
         self.assertTrue(branding.DEFAULT_ICON)
 
     def test_light_logo_is_selected_only_for_light_and_falls_back_to_raven(self):

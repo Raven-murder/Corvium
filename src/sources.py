@@ -114,3 +114,7 @@ def sources_panel_dock(state):
 
 def close_sources_panel(state):
     state.pop("sources_panel", None)
+
+
+def has_answer_sources(sources, answer):
+    return bool(cited_sources(sources, answer))

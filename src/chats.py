@@ -3,8 +3,10 @@ import json
 import re
 
 if __package__:
+    from .read_cache import cached_list
     from .db import database_session
 else:
+    from read_cache import cached_list
     from db import database_session
 
 
@@ -34,6 +36,7 @@ def create_chat(title="New chat"):
         ).fetchone()["id"]
 
 
+@cached_list
 def list_chats():
     with database_session() as connection:
         return [dict(row) for row in connection.execute(
@@ -85,11 +88,26 @@ def add_message(chat_id, role, content, sources=None, error=False, kind="text"):
 
 
 def list_messages(chat_id):
+    if __package__:
+        from .db import backend
+    else:
+        from db import backend
     with database_session() as connection:
-        _chat(connection, chat_id)
-        messages = [dict(row) for row in connection.execute(
-            "SELECT * FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,)
-        )]
+        if backend() == "postgres":
+            rows = connection.execute(
+                "SELECT c.id AS existing_chat_id, m.* FROM chats c LEFT JOIN messages m ON m.chat_id = c.id "
+                "WHERE c.id = ? ORDER BY m.id", (chat_id,)
+            ).fetchall()
+            if not rows:
+                raise ValueError("Chat does not exist.")
+            messages = [dict(row) for row in rows if row["id"] is not None]
+            for message in messages:
+                message.pop("existing_chat_id", None)
+        else:
+            _chat(connection, chat_id)
+            messages = [dict(row) for row in connection.execute(
+                "SELECT * FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,)
+            )]
     for message in messages:
         message["sources"] = json.loads(message["sources"])
         message["error"] = bool(message["error"])
@@ -142,6 +160,7 @@ def set_message_pinned(message_id, pinned=True):
     _set_pinned("messages", message_id, pinned)
 
 
+@cached_list
 def list_pinned_messages():
     with database_session() as connection:
         messages = [dict(row) for row in connection.execute(

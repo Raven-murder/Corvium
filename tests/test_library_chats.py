@@ -124,9 +124,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(updated["id"], document["id"])
             self.assertEqual(updated["folder_id"], folder)
             self.assertEqual(updated["display_name"], "My database notes")
-            stored = self.folder / "files" / f"{document['id']}.md"
-            self.assertEqual((self.folder / updated["stored_path"]).resolve(), stored.resolve())
-            self.assertEqual(stored.read_bytes(), path.read_bytes())
+            self.assertEqual(db.get_file_bytes(db.current_workspace_id(), updated["id"]), path.read_bytes())
             self.assertEqual(updated["kind"], "text")
             self.assertEqual(ingest.search("database")[0]["doc_name"], "My database notes")
             self.assertEqual(actions._sample_chunks()[0]["doc_name"], "My database notes")
@@ -235,7 +233,8 @@ class MigrationTests(unittest.TestCase):
             "notes.md": "text", "page.HTML": "html", "diagram.PNG": "image",
         })
         self.assertTrue(all(d["display_name"] == d["name"] for d in documents))
-        self.assertTrue(all(d["stored_path"] is None and d["folder_id"] is None for d in documents))
+        self.assertTrue(all(d["folder_id"] is None for d in documents))
+        self.assertTrue(all(db.get_file_bytes(db.current_workspace_id(), d["id"]) is None for d in documents))
         self.assertEqual(len({d["position"] for d in documents}), 6)
         migrated = chats.list_chats()
         self.assertEqual(len(migrated), 1)
@@ -256,8 +255,8 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(len(chats.list_chats()), 1)
 
     def test_failed_migration_rolls_back_schema_and_records(self):
-        with patch.object(db, "infer_document_kind", side_effect=RuntimeError("Migration interrupted")):
-            with self.assertRaises(RuntimeError):
+        with patch("src.sqlite_migrations.infer_document_kind", side_effect=RuntimeError("Migration interrupted")):
+            with self.assertRaises(db.StorageError):
                 db.init_db()
         connection = sqlite3.connect(self.path)
         self.addCleanup(connection.close)
