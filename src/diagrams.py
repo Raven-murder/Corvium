@@ -2,12 +2,12 @@ import json
 import re
 
 if __package__:
-    from .config import CHAT_MODEL, get_client
+    from .config import CHAT_MODEL, get_client, StorageError
     from .generation import stream_completion
     from .ingest import search
     from .usage import reserve_workspace_action, UsageLimitError
 else:
-    from config import CHAT_MODEL, get_client
+    from config import CHAT_MODEL, get_client, StorageError
     from generation import stream_completion
     from ingest import search
     from usage import reserve_workspace_action, UsageLimitError
@@ -282,7 +282,7 @@ def generate_diagram(question, kind, doc_ids=None, *, on_chunk=None, check_cance
                 choice = response.choices[0] if response.choices else None
                 content = choice.message.content if choice is not None else None
                 finish_reason = getattr(choice, "finish_reason", None)
-        except UsageLimitError:
+        except (UsageLimitError, StorageError):
             raise
         except Exception:
             prompt += "\nCorrection: generation failed. Return complete valid diagram code with no more than 25 nodes."

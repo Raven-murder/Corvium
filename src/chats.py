@@ -30,8 +30,8 @@ def create_chat(title="New chat"):
     now = _now()
     with database_session(write=True) as connection:
         return connection.execute(
-            "INSERT INTO chats(title, created_at, updated_at) VALUES (?, ?, ?)", (title, now, now)
-        ).lastrowid
+            'INSERT INTO chats(title, created_at, updated_at) VALUES (?, ?, ?) RETURNING id', (title, now, now)
+        ).fetchone()["id"]
 
 
 def list_chats():
@@ -72,12 +72,11 @@ def add_message(chat_id, role, content, sources=None, error=False, kind="text"):
         ).fetchone() is None
         title = _title(content) if first_question else chat["title"]
         cursor = connection.execute(
-            "INSERT INTO messages(session_id, chat_id, role, content, created_at, sources, error, kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            'INSERT INTO messages(session_id, chat_id, role, content, created_at, sources, error, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
             (str(chat_id), chat_id, role, content, now, json.dumps(sources or []), int(error), kind),
         )
         connection.execute("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?", (title, now, chat_id))
-        return cursor.lastrowid
+        return cursor.fetchone()["id"]
 
 
 def list_messages(chat_id):

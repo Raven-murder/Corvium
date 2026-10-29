@@ -5,9 +5,9 @@ import re
 import streamlit as st
 from pypdf import PdfReader
 
-from .db import database_session
+from .db import database_session, current_workspace_id, get_file_bytes
 from .extractors import extract_docx, extract_pptx, extract_html, extract_text
-from .workspaces import get_storage, resolve_original_path
+from .workspaces import get_storage
 
 
 def _record(doc_id):
@@ -24,11 +24,7 @@ def _record(doc_id):
 
 
 def _original(document):
-    path = resolve_original_path(document.get("stored_path"))
-    try:
-        return path.read_bytes() if path is not None and path.is_file() else None
-    except OSError:
-        return None
+    return get_file_bytes(current_workspace_id(), document["id"])
 
 
 def _visible(text):

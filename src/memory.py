@@ -96,7 +96,7 @@ def save_memories(items):
                 if existing and np.any(_similarities(existing, vector) > 0.8):
                     continue
                 connection.execute(
-                    "INSERT INTO memories(text, kind, created_at, embedding) VALUES (?, ?, ?, ?)",
+                    'INSERT INTO memories(text, kind, created_at, embedding) VALUES (?, ?, ?, ?) RETURNING id',
                     (item["text"], item["kind"], datetime.now(timezone.utc).isoformat(),
                      embedding_to_blob(vector)),
                 )
@@ -184,9 +184,9 @@ def add_memory(text, kind="fact"):
             if existing:
                 return existing["id"]
             return connection.execute(
-                "INSERT INTO memories(text, kind, created_at, embedding) VALUES (?, ?, ?, ?)",
+                'INSERT INTO memories(text, kind, created_at, embedding) VALUES (?, ?, ?, ?) RETURNING id',
                 (text, kind, datetime.now(timezone.utc).isoformat(), embedding_to_blob(vector)),
-            ).lastrowid
+            ).fetchone()["id"]
     finally:
         connection.close()
 
@@ -197,11 +197,15 @@ def update_memory_text(memory_id, text):
     connection = connect()
     try:
         existing = connection.execute("SELECT text FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if existing is None:
-            raise ValueError("Memory does not exist.")
-        if existing["text"] == text:
-            return False
-        vector = embed_texts([text])[0]
+    finally:
+        connection.close()
+    if existing is None:
+        raise ValueError("Memory does not exist.")
+    if existing["text"] == text:
+        return False
+    vector = embed_texts([text])[0]
+    connection = connect()
+    try:
         with connection:
             cursor = connection.execute(
                 "UPDATE memories SET text = ?, embedding = ? WHERE id = ?",

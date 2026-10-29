@@ -1,3 +1,4 @@
+from .config import StorageError
 import math
 
 from .db import database_session
@@ -56,6 +57,8 @@ def search_documents(query, workspace):
         reserve_workspace_action("tool")
         if chunks:
             semantic = retrieve_passages(query, k=len(chunks), embedding_attempts=1)
+    except StorageError:
+        raise
     except UsageLimitError:
         notice = "Semantic search is unavailable because the demo's usage limit has been reached. Filename matches are still shown."
     except Exception:

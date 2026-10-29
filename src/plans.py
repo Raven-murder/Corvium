@@ -33,9 +33,9 @@ def create_plan(title, body, days):
     body_json = json.dumps(body, ensure_ascii=False)
     with database_session(write=True) as connection:
         return connection.execute(
-            "INSERT INTO plans(title, body_json, days, created_at, pinned) VALUES (?, ?, ?, ?, 0)",
+            'INSERT INTO plans(title, body_json, days, created_at, pinned) VALUES (?, ?, ?, ?, 0) RETURNING id',
             (title, body_json, days, datetime.now(timezone.utc).isoformat()),
-        ).lastrowid
+        ).fetchone()["id"]
 
 
 def list_plans():

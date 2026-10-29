@@ -23,7 +23,7 @@ def _folder(connection, folder_id):
 
 def _ordered_ids(connection, folder_id):
     return [row["id"] for row in connection.execute(
-        "SELECT id FROM documents WHERE folder_id IS ? ORDER BY position, id", (folder_id,)
+        "SELECT id FROM documents WHERE (folder_id = ? OR (folder_id IS NULL AND CAST(? AS BIGINT) IS NULL)) ORDER BY position, id", (folder_id, folder_id)
     )]
 
 
@@ -34,10 +34,10 @@ def _set_positions(connection, ids):
 def create_folder(name):
     name = _name(name)
     with database_session(write=True) as connection:
-        position = connection.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM folders").fetchone()[0]
+        position = connection.execute("SELECT COALESCE(MAX(position), -1) + 1 AS position FROM folders").fetchone()["position"]
         return connection.execute(
-            "INSERT INTO folders(name, position) VALUES (?, ?)", (name, position)
-        ).lastrowid
+            'INSERT INTO folders(name, position) VALUES (?, ?) RETURNING id', (name, position)
+        ).fetchone()["id"]
 
 
 def rename_folder(folder_id, name):
@@ -71,8 +71,8 @@ def move_document(document_id, folder_id=None):
         if document["folder_id"] == folder_id:
             return
         position = connection.execute(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM documents WHERE folder_id IS ?", (folder_id,)
-        ).fetchone()[0]
+            "SELECT COALESCE(MAX(position), -1) + 1 AS position FROM documents WHERE (folder_id = ? OR (folder_id IS NULL AND CAST(? AS BIGINT) IS NULL))", (folder_id, folder_id)
+        ).fetchone()["position"]
         connection.execute(
             "UPDATE documents SET folder_id = ?, position = ? WHERE id = ?",
             (folder_id, position, document_id),

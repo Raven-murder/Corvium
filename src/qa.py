@@ -8,7 +8,7 @@ if __package__:
     from .diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
     from .usage import reserve_workspace_action
     from .chats import add_message, list_messages
-    from .config import CHAT_MODEL, get_client, safe_error
+    from .config import CHAT_MODEL, get_client, safe_error, StorageError
     from .generation import stream_completion
     from .ingest import search
     from .memory import extract_memories, save_memories, get_relevant_memories
@@ -16,7 +16,7 @@ else:
     from diagrams import diagram_request_kind, generate_diagram, parse_diagram_message
     from usage import reserve_workspace_action
     from chats import add_message, list_messages
-    from config import CHAT_MODEL, get_client, safe_error
+    from config import CHAT_MODEL, get_client, safe_error, StorageError
     from generation import stream_completion
     from ingest import search
     from memory import extract_memories, save_memories, get_relevant_memories
@@ -90,6 +90,8 @@ def _answer_question(question, k, history, *, on_chunk=None, check_cancel=None, 
     memory_status, has_personal_facts = _remember_question(question)
     try:
         memories = get_relevant_memories(question)
+    except StorageError:
+        raise
     except Exception:
         memories = []
     if not sources and not has_personal_facts:
@@ -141,6 +143,8 @@ def _answer_question(question, k, history, *, on_chunk=None, check_cancel=None, 
 def _remember_question(question):
     try:
         items = extract_memories(question)
+    except StorageError:
+        raise
     except Exception:
         return "Memory extraction failed. Do not claim anything was saved.", False
     if not items:
@@ -152,6 +156,8 @@ def _remember_question(question):
                 saved.append(item["text"])
             else:
                 skipped.append(item["text"])
+        except StorageError:
+            raise
         except Exception:
             failed.append(item["text"])
     status = []

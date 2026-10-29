@@ -7,3 +7,5 @@ python-docx
 python-pptx
 Pillow
 pypdfium2
+psycopg[binary]
+psycopg_pool

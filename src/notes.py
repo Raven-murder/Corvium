@@ -55,12 +55,12 @@ def create_note(title, body, doc_id=None):
     with database_session(write=True) as connection:
         if doc_id is not None:
             _document(connection, doc_id)
-        if connection.execute("SELECT COUNT(*) FROM notes").fetchone()[0] >= MAX_NOTES:
+        if connection.execute("SELECT COUNT(*) AS count FROM notes").fetchone()["count"] >= MAX_NOTES:
             raise NotesError("Your notes are full. Delete a note before adding another.")
         return connection.execute(
-            "INSERT INTO notes(title, body, doc_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            'INSERT INTO notes(title, body, doc_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING id',
             (title, body, doc_id, now, now),
-        ).lastrowid
+        ).fetchone()["id"]
 
 
 def update_note(note_id, title, body):
@@ -144,10 +144,10 @@ def add_bookmark(doc_id, locator, label=""):
         if existing is not None:
             return existing["id"]
         label = _label(label, locator_label(document["kind"], locator)[:MAX_TITLE])
-        if connection.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0] >= MAX_BOOKMARKS:
+        if connection.execute("SELECT COUNT(*) AS count FROM bookmarks").fetchone()["count"] >= MAX_BOOKMARKS:
             raise NotesError("Your bookmarks are full. Delete a bookmark before adding another.")
-        return connection.execute("INSERT INTO bookmarks(doc_id, locator, label, created_at) VALUES (?, ?, ?, ?)",
-                                  (doc_id, locator, label, now)).lastrowid
+        return connection.execute('INSERT INTO bookmarks(doc_id, locator, label, created_at) VALUES (?, ?, ?, ?) RETURNING id',
+                                  (doc_id, locator, label, now)).fetchone()["id"]
 
 
 def rename_bookmark(bookmark_id, label):
@@ -171,7 +171,7 @@ def list_bookmarks(doc_id=None):
             "SELECT b.*, d.display_name AS doc_name, d.kind AS doc_kind FROM bookmarks b "
             "JOIN documents d ON d.id = b.doc_id "
             + ("WHERE b.doc_id = ? " if doc_id is not None else "")
-            + "ORDER BY d.display_name COLLATE NOCASE, d.id, b.created_at, b.id",
+            + "ORDER BY lower(d.display_name), d.id, b.created_at, b.id",
             (doc_id,) if doc_id is not None else (),
         )]
 

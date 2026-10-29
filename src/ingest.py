@@ -4,7 +4,6 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from io import BytesIO
-import tempfile
 import sys
 import time
 
@@ -12,15 +11,15 @@ import numpy as np
 from pypdf import PdfReader
 
 if __package__:
-    from .config import EMBED_MODEL, PROJECT_ROOT, get_client, get_vision_model, safe_error
-    from .db import connect, embedding_from_blob, embedding_to_blob, init_db, infer_document_kind, normalize_document_ids
+    from .config import EMBED_MODEL, PROJECT_ROOT, get_client, get_vision_model, safe_error, StorageError
+    from .db import connect, embedding_from_blob, embedding_to_blob, init_db, infer_document_kind, normalize_document_ids, database_session, put_file, check_upload_guard, check_upload_capacity, cached_chunks
     from .extractors import extract_docx, extract_pptx, extract_html, extract_text
     from .ocr import ocr_image
     from .workspaces import get_storage, WorkspaceError
     from .usage import reserve_workspace_action, UsageLimitError
 else:
-    from config import EMBED_MODEL, PROJECT_ROOT, get_client, get_vision_model, safe_error
-    from db import connect, embedding_from_blob, embedding_to_blob, init_db, infer_document_kind, normalize_document_ids
+    from config import EMBED_MODEL, PROJECT_ROOT, get_client, get_vision_model, safe_error, StorageError
+    from db import connect, embedding_from_blob, embedding_to_blob, init_db, infer_document_kind, normalize_document_ids, database_session, put_file, check_upload_guard, check_upload_capacity, cached_chunks
     from extractors import extract_docx, extract_pptx, extract_html, extract_text
     from ocr import ocr_image
     from workspaces import get_storage, WorkspaceError
@@ -33,7 +32,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 def _read_file(path):
     path = Path(path)
     storage = get_storage()
-    if storage.workspace_id is not None and not path.resolve().is_relative_to(storage.root):
+    if storage.workspace_id not in {None, "demo-template"} and not path.resolve().is_relative_to(storage.root):
         raise WorkspaceError("This file is not available in the current workspace.")
     if not path.is_file():
         raise ValueError(f"File does not exist: {path.name}")
@@ -140,7 +139,7 @@ def embed_texts(texts: list[str], *, max_attempts=3):
                     raise ValueError("Embedding response contains invalid or zero vectors.")
                 vectors.append(array)
                 break
-            except UsageLimitError:
+            except (UsageLimitError, StorageError):
                 raise
             except Exception as error:
                 if attempt == max_attempts - 1:
@@ -153,70 +152,60 @@ def embed_texts(texts: list[str], *, max_attempts=3):
 
 
 def ingest_file(path):
-    """Replace indexed content while preserving document identity and library metadata."""
     path = Path(path)
-    contents = _read_file(path)
+    return ingest_bytes(path.name, _read_file(path))
+
+
+def ingest_bytes(name, contents):
+    """Replace a document atomically, storing its original bytes with its chunks."""
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise ValueError("Choose a valid filename.")
+    if len(contents) > MAX_FILE_BYTES:
+        raise ValueError("This file exceeds the 25 MB limit. Please upload a smaller file.")
+    check_upload_guard()
+    init_db()
+    with database_session() as connection:
+        previous = connection.execute("SELECT id FROM documents WHERE name = ?", (name,)).fetchone()
+        check_upload_capacity(connection, len(contents), replacing_doc_id=previous["id"] if previous else None)
     reserve_workspace_action("upload")
-    pages = _extract_contents(contents, path.suffix.lower())
-    chunks = [
-        chunk for page in pages
-        for chunk in chunk_text(page["text"], page=page["page"], section=page.get("section"))
-    ]
+    pages = _extract_contents(contents, Path(name).suffix.lower())
+    chunks = [chunk for page in pages for chunk in chunk_text(page["text"], page=page["page"], section=page.get("section"))]
     warnings = list(dict.fromkeys(warning for page in pages for warning in page.get("warnings", [])))
     status = "; ".join((["indexed"] if chunks else ["no text found"]) + warnings)
     vectors = embed_texts([chunk["text"] for chunk in chunks]) if chunks else []
-    init_db()
-    files_dir = get_storage().files_dir
-    files_dir.mkdir(parents=True, exist_ok=True)
-    staged = None
-    destination = None
-    previous = None
-    replaced = False
-    connection = connect()
-    try:
-        with tempfile.NamedTemporaryFile(dir=files_dir, prefix="ingest-", delete=False) as temporary:
-            staged = Path(temporary.name)
-            temporary.write(contents)
-        with connection:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute("SELECT id FROM documents WHERE name = ?", (path.name,)).fetchone()
-            uploaded_at = datetime.now(timezone.utc).isoformat()
-            kind = infer_document_kind(path.name)
-            if existing:
-                document_id = existing["id"]
-                connection.execute("DELETE FROM chunks WHERE doc_id = ?", (document_id,))
-            else:
-                document_id = connection.execute(
-                    "INSERT INTO documents(name, uploaded_at, n_chunks, display_name, kind) VALUES (?, ?, ?, ?, ?)",
-                    (path.name, uploaded_at, len(chunks), path.name, kind),
-                ).lastrowid
-            destination = files_dir / f"{document_id}{path.suffix.lower() or '.txt'}"
-            if destination.resolve() != destination.absolute():
-                raise WorkspaceError("This file is not available in the current workspace.")
-            previous = destination.read_bytes() if destination.exists() else None
-            connection.execute(
-                "UPDATE documents SET uploaded_at = ?, n_chunks = ?, kind = ?, stored_path = ?, status = ? WHERE id = ?",
-                (uploaded_at, len(chunks), kind, str(destination.relative_to(get_storage().root)), status, document_id),
-            )
-            connection.executemany(
-                "INSERT INTO chunks(doc_id, page, text, embedding, section) VALUES (?, ?, ?, ?, ?)",
-                [(document_id, chunk["page"], chunk["text"], embedding_to_blob(vector), chunk["section"])
-                 for chunk, vector in zip(chunks, vectors)],
-            )
-            staged.replace(destination)
-            replaced = True
-    except Exception:
-        if replaced:
-            if previous is None:
-                destination.unlink(missing_ok=True)
-            else:
-                destination.write_bytes(previous)
-        raise
-    finally:
-        connection.close()
-        if staged is not None:
-            staged.unlink(missing_ok=True)
+    blobs = [embedding_to_blob(vector) for vector in vectors]
+    check_upload_guard()
+    with database_session(write=True) as connection:
+        existing = connection.execute("SELECT id FROM documents WHERE name = ?", (name,)).fetchone()
+        check_upload_capacity(connection, len(contents), sum(len(blob) for blob in blobs), existing["id"] if existing else None)
+        uploaded_at = datetime.now(timezone.utc).isoformat()
+        kind = infer_document_kind(name)
+        if existing:
+            document_id = existing["id"]
+            connection.execute("DELETE FROM chunks WHERE doc_id = ?", (document_id,))
+        else:
+            document_id = connection.execute(
+                "INSERT INTO documents(name, uploaded_at, n_chunks, display_name, kind) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                (name, uploaded_at, len(chunks), name, kind),
+            ).fetchone()["id"]
+        connection.execute("UPDATE documents SET uploaded_at = ?, n_chunks = ?, kind = ?, stored_path = NULL, status = ? WHERE id = ?",
+                           (uploaded_at, len(chunks), kind, status, document_id))
+        put_file(connection, document_id, name, contents)
+        connection.executemany("INSERT INTO chunks(doc_id, page, text, embedding, section) VALUES (?, ?, ?, ?, ?)",
+                               [(document_id, chunk["page"], chunk["text"], blob, chunk["section"]) for chunk, blob in zip(chunks, blobs)])
     return len(chunks)
+
+
+def ingest_stored_document(doc_id):
+    from .db import current_workspace_id, get_file_bytes
+    with database_session() as connection:
+        document = connection.execute("SELECT name FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if document is None:
+        raise ValueError("This document is no longer available.")
+    contents = get_file_bytes(current_workspace_id(), doc_id)
+    if contents is None:
+        raise ValueError("The original file is unavailable.")
+    return ingest_bytes(document["name"], contents)
 
 
 def get_ingest_status(name):
@@ -235,6 +224,8 @@ def ingest_files(paths):
         try:
             count = ingest_file(path)
             results.append({"name": name, "count": count, "status": get_ingest_status(name), "error": None})
+        except StorageError:
+            raise
         except Exception as error:
             results.append({"name": name, "count": 0, "status": "failed", "error": safe_error(error)})
     return results
@@ -249,20 +240,13 @@ def search(query, k=5, source_doc_ids=None, *, embedding_attempts=3):
     ids = normalize_document_ids(source_doc_ids)
     if ids == []:
         return []
-    init_db()
-    connection = connect()
-    try:
-        where = " WHERE documents.id IN (" + ",".join("?" for _ in ids) + ")" if ids is not None else ""
-        rows = connection.execute(
-            "SELECT documents.id AS doc_id, documents.display_name AS doc_name, chunks.page, chunks.section, chunks.text, chunks.embedding "
-            "FROM chunks JOIN documents ON documents.id = chunks.doc_id" + where + " ORDER BY chunks.id",
-            ids or [],
-        ).fetchall()
-    finally:
-        connection.close()
+    rows, vectors = cached_chunks()
+    if ids is not None:
+        selected = [index for index, row in enumerate(rows) if row["doc_id"] in ids]
+        rows = [rows[index] for index in selected]
+        vectors = vectors[selected]
     if not rows:
         return []
-    vectors = np.stack([embedding_from_blob(row["embedding"]) for row in rows])
     if vectors.shape[1] != VECTOR_LENGTH or not np.isfinite(vectors).all():
         raise ValueError("Stored embeddings are invalid; re-ingest the documents.")
     query_vector = (embed_texts([query]) if embedding_attempts == 3 else embed_texts([query], max_attempts=embedding_attempts))[0]

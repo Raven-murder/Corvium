@@ -1,10 +1,8 @@
 import hashlib
 import mimetypes
-from pathlib import Path
 import re
 
-from .workspaces import resolve_original_path
-from .db import database_session, infer_document_kind
+from .db import database_session, infer_document_kind, current_workspace_id, get_file_bytes
 from .qa import cited_sources
 
 
@@ -78,17 +76,11 @@ def group_answer_sources(sources, answer):
 
 
 def original_download(source_group):
-    stored_path = source_group.get("stored_path")
-    if not stored_path:
+    doc_id = source_group.get("doc_id", source_group.get("id"))
+    if doc_id is None:
         return None
-    path = resolve_original_path(stored_path)
-    if path is None:
-        return None
-    try:
-        if not path.is_file():
-            return None
-        data = path.read_bytes()
-    except OSError:
+    data = get_file_bytes(current_workspace_id(), doc_id)
+    if data is None:
         return None
     return {"data": data, "file_name": source_group["name"],
             "mime": mimetypes.guess_type(source_group["name"])[0] or "application/octet-stream"}

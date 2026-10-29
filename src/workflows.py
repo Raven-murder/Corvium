@@ -12,7 +12,7 @@ from .diagrams import generate_diagram, parse_diagram_message
 from .actions import generate_study_plan, generate_quiz, grade_quiz
 from .plans import create_plan, list_plans, get_plan, rename_plan, pin_plan, delete_plan
 from . import notes
-from .ingest import MAX_FILE_BYTES, ingest_file, get_ingest_status
+from .ingest import MAX_FILE_BYTES, ingest_file, ingest_bytes, get_ingest_status
 from .demo import seed_demo, reset_demo
 
 
@@ -148,11 +148,7 @@ def process_uploads(uploads, state):
             previous = processed.get(name)
             if previous and previous.get("fingerprint") == fingerprint:
                 continue
-            folder = get_storage().uploads_dir
-            folder.mkdir(parents=True, exist_ok=True)
-            destination = folder / name
-            destination.write_bytes(contents)
-            count = ingest_file(destination)
+            count = ingest_bytes(name, contents)
             status = get_ingest_status(name)
             processed[name] = {"fingerprint": fingerprint, "count": count, "error": None}
             events.append({"kind": "success" if status == "indexed" else "warning",

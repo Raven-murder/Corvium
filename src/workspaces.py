@@ -8,6 +8,12 @@ import shutil
 import time
 from uuid import uuid4
 
+if not __package__:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "src"
+    sys.modules["src.workspaces"] = sys.modules[__name__]
+
 if __package__:
     from . import config
 else:
@@ -79,6 +85,9 @@ def storage_context(root, workspace_id=None):
 
 
 def database_identity(storage):
+    from . import db
+    if db.backend() == "postgres":
+        return db._workspace_generation(storage.workspace_id)
     metadata = storage.db_path.stat()
     return metadata.st_dev, metadata.st_ino
 
@@ -157,29 +166,58 @@ def _remove_tree(path, parent):
 
 
 def _touch(storage, now=None):
-    marker = storage.root / ".last_used"
-    marker.touch(exist_ok=True)
-    if now is not None:
-        os.utime(marker, (now, now))
+    from . import db
+    if storage.workspace_id:
+        db._touch_record(storage.workspace_id, now)
+    if db.backend() == "sqlite":
+        marker = storage.root / ".last_used"
+        marker.touch(exist_ok=True)
+        if now is not None:
+            os.utime(marker, (now, now))
 
 
 def template_directory():
     return config.DATA_DIR / "demo_template"
 
 
+@contextmanager
+def _template_context(root):
+    token = _STORAGE.set(Storage(Path(root).resolve(), "demo-template"))
+    try:
+        yield _STORAGE.get()
+    finally:
+        _STORAGE.reset(token)
+
+
 def ensure_template():
+    from . import db, demo
+
+    if db.backend() == "postgres":
+        db.init_db()
+        with db.template_lock():
+            record = db._workspace_info("demo-template")
+            if record is not None and record["ready"]:
+                return "demo-template"
+            db._make_workspace("demo-template", ready=0)
+            with db._admin_session() as connection:
+                db._clear_rows(connection, "demo-template")
+            with _template_context(config.DATA_DIR / "demo_template"):
+                results = demo._seed_demo_files() or []
+                if any(result["error"] for result in results):
+                    raise WorkspaceError("The demo could not be prepared. Please try again later.")
+            with db._admin_session() as connection:
+                connection._run("UPDATE workspaces SET ready = 1 WHERE id = ?", ("demo-template",))
+        return "demo-template"
     template = template_directory()
     with file_lock(config.DATA_DIR / "demo_template.lock"):
         if (template / ".ready").is_file() and (template / "app.db").is_file():
+            with _template_context(template):
+                db.init_db()
             return template
         stage = config.DATA_DIR / (".demo-template-" + uuid4().hex)
         stage.mkdir(parents=True)
         try:
-            if __package__:
-                from . import db, demo
-            else:
-                import db, demo
-            with storage_context(stage):
+            with _template_context(stage):
                 db.init_db()
                 results = demo._seed_demo_files() or []
                 if any(result["error"] for result in results):
@@ -189,7 +227,7 @@ def ensure_template():
             if template.exists():
                 _remove_tree(template, config.DATA_DIR)
             stage.replace(template)
-        except Exception:
+        except BaseException:
             _remove_tree(stage, config.DATA_DIR)
             raise
     return template
@@ -201,6 +239,8 @@ def _restore_locked(storage, template):
     backup = base / (".restore-" + uuid4().hex)
     try:
         shutil.copytree(template, stage)
+        from .db import rebind_sqlite_workspace
+        rebind_sqlite_workspace(stage / "app.db", storage.workspace_id)
         _touch(Storage(stage))
         if storage.root.exists():
             storage.root.replace(backup)
@@ -216,12 +256,26 @@ def _restore_locked(storage, template):
 
 
 def ensure_workspace(storage):
-    if storage.workspace_id is None:
-        storage.root.mkdir(parents=True, exist_ok=True)
+    from . import db
+
+    if storage.workspace_id is None or storage.workspace_id == "demo-template":
+        if db.backend() == "sqlite":
+            storage.root.mkdir(parents=True, exist_ok=True)
         return
     expected = workspace_storage(storage.workspace_id)
     if storage != expected:
         raise WorkspaceError("This workspace is unavailable. Please refresh the page.")
+    if db.backend() == "postgres":
+        db.init_db()
+        if db._workspace_info(storage.workspace_id) is None:
+            ensure_template()
+            try:
+                db.clone_workspace("demo-template", storage.workspace_id)
+            except ValueError:
+                if db._workspace_info(storage.workspace_id) is None:
+                    raise
+        _touch(storage)
+        return
     template = ensure_template() if not storage.db_path.is_file() else None
     with file_lock(storage.root.parent / (storage.workspace_id + ".lock")):
         if not storage.db_path.is_file():
@@ -232,37 +286,35 @@ def ensure_workspace(storage):
 
 
 def restore_workspace():
+    from . import db
     storage = get_storage()
     if storage.workspace_id is None:
         raise WorkspaceError("Open the app to select a workspace first.")
-    template = ensure_template()
-    with file_lock(storage.root.parent / (storage.workspace_id + ".lock")):
-        _restore_locked(storage, template)
+    if db.backend() == "postgres":
+        db.reset_workspace(storage.workspace_id)
+    else:
+        template = ensure_template()
+        with file_lock(storage.root.parent / (storage.workspace_id + ".lock")):
+            _restore_locked(storage, template)
 
 
 def cleanup_workspaces(now=None, exclude=()):
-    now = time.time() if now is None else now
+    from . import db
+    removed = db.cleanup_inactive_workspaces(now, exclude)
+    if db.backend() != "sqlite":
+        return
     base = (config.DATA_DIR / "workspaces").resolve()
-    if not base.exists():
-        return
-    try:
-        entries = list(base.iterdir())
-    except OSError:
-        return
-    for path in entries:
-        if _ID.fullmatch(path.name) is None or path.name in exclude:
-            continue
+    for workspace_id in removed:
         try:
-            storage = workspace_storage(path.name)
-            if not storage.root.is_dir():
-                continue
-            with file_lock(base / (path.name + ".lock"), timeout=0):
-                marker = storage.root / ".last_used"
-                modified = marker.stat().st_mtime if marker.exists() else storage.root.stat().st_mtime
-                if modified < now - 7 * 24 * 60 * 60:
-                    _remove_tree(storage.root, base)
+            storage = workspace_storage(workspace_id)
+            with file_lock(base / (workspace_id + ".lock"), timeout=0):
+                _remove_tree(storage.root, base)
         except (OSError, WorkspaceError):
-            continue
+            try:
+                marker = storage.root / ".last_used"
+                db._touch_record(workspace_id, (marker if marker.exists() else storage.root).stat().st_mtime)
+            except OSError:
+                pass
 
 
 def bind_workspace(query_params, state):
@@ -277,7 +329,8 @@ def bind_workspace(query_params, state):
 
 
 def resolve_original_path(stored_path):
-    if not stored_path:
+    from . import db
+    if db.backend() == "postgres" or not stored_path:
         return None
     storage = get_storage()
     path = Path(stored_path)

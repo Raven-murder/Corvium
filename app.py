@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from src.config import APP_NAME, safe_error
+from src.config import APP_NAME, safe_error, StorageError
 from src.chats import list_chats, list_messages, list_pinned_messages, chat_label, pinned_message_label
 from src.library import list_library, list_documents, group_images_by_type, reorder_document
 from src.memory import list_memories
@@ -184,7 +184,11 @@ def show_chat_message(message, chat_id, scope="chat"):
 def show_live_answer(workspace_id, chat_id, message_ids):
     if st.query_params.get("w") != workspace_id:
         return
-    job = flow.live_answer_job(st.session_state, workspace_id, chat_id, message_ids)
+    try:
+        job = flow.live_answer_job(st.session_state, workspace_id, chat_id, message_ids)
+    except StorageError as error:
+        st.error(safe_error(error))
+        return
     if job is None:
         return
     if job["status"] != "running" and job["finalized"]:
@@ -590,6 +594,8 @@ def show_document_viewer():
             st.caption(f"Page {locator['page']} of {data['page_count']}")
             try:
                 rendered = doc_viewer.render_pdf_page(document["id"], locator["page"])
+            except StorageError:
+                raise
             except Exception:
                 rendered = None
             if rendered:
@@ -618,6 +624,8 @@ def show_document_viewer():
                     on_change=run_callback, args=(doc_viewer.choose_section, key),
                 )
             show_viewer_parts(data, locator)
+    except StorageError as error:
+        st.error(safe_error(error))
     except Exception:
         st.error("This document could not be opened. It may no longer be available.")
     st.button("Close", key="close_document_viewer", on_click=run_callback, args=(doc_viewer.close_viewer,))
@@ -858,11 +866,18 @@ def main():
     for message in messages:
         show_chat_message(message, chat_id)
     message_ids = {message["id"] for message in messages}
-    if flow.live_answer_job(st.session_state, st.session_state["workspace_id"], chat_id, message_ids) is not None:
-        show_live_answer(st.session_state["workspace_id"], chat_id, message_ids)
+    try:
+        if flow.live_answer_job(st.session_state, st.session_state["workspace_id"], chat_id, message_ids) is not None:
+            show_live_answer(st.session_state["workspace_id"], chat_id, message_ids)
+    except StorageError as error:
+        st.error(safe_error(error))
     show_sources_panel()
     show_active_dialog()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StorageError as error:
+        st.error(safe_error(error))
+        st.stop()

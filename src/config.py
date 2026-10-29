@@ -4,6 +4,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import os
+import re
+from threading import RLock
+from urllib.parse import unquote, urlsplit
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,10 +27,11 @@ _CLIENT_CONTEXT = ContextVar("generation_client_context", default=None)
 class ClientSettings:
     api_key: str | None = field(repr=False)
     base_url: str
+    database_url: str | None = field(default=None, repr=False)
 
 
 def capture_client_settings():
-    return ClientSettings(get_api_key(), os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.us-central1.nebius.com/v1/"))
+    return ClientSettings(get_api_key(), os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.us-central1.nebius.com/v1/"), get_database_url())
 
 
 @contextmanager
@@ -56,6 +60,58 @@ WORKSPACE_CHAT_LIMIT = _limit("WORKSPACE_CHAT_LIMIT", 60)
 WORKSPACE_TOOL_LIMIT = _limit("WORKSPACE_TOOL_LIMIT", 15)
 WORKSPACE_UPLOAD_LIMIT = _limit("WORKSPACE_UPLOAD_LIMIT", 20)
 GLOBAL_API_ACTION_LIMIT = _limit("GLOBAL_API_ACTION_LIMIT", 3000)
+
+MAX_FILE_BYTES = 25 * 1024 * 1024
+MAX_WORKSPACE_BYTES = _limit("WORKSPACE_STORAGE_LIMIT_MB", 80) * 1024 * 1024
+DB_SOFT_LIMIT_MB = _limit("DB_SOFT_LIMIT_MB", 400)
+WORKSPACE_RETENTION_DAYS = _limit("WORKSPACE_RETENTION_DAYS", 30)
+_DATABASE_SECRET_LOCK = RLock()
+_DATABASE_SECRET_READY = False
+_DATABASE_SECRET = None
+
+
+class StorageError(RuntimeError):
+    public_message = True
+
+    def __init__(self, message="Storage is unavailable, please try again"):
+        super().__init__(message)
+
+
+def get_database_url():
+    global _DATABASE_SECRET_READY, _DATABASE_SECRET
+    value = os.environ.get("DATABASE_URL")
+    if value and value.strip():
+        return value.strip()
+    context = _CLIENT_CONTEXT.get()
+    if context is not None:
+        return context[0].database_url
+    with _DATABASE_SECRET_LOCK:
+        if not _DATABASE_SECRET_READY:
+            try:
+                value = st.secrets.get("DATABASE_URL")
+                _DATABASE_SECRET = value.strip() if isinstance(value, str) and value.strip() else None
+            except (StreamlitSecretNotFoundError, FileNotFoundError):
+                _DATABASE_SECRET = None
+            except Exception:
+                raise StorageError() from None
+            _DATABASE_SECRET_READY = True
+        return _DATABASE_SECRET
+
+
+def redact_storage_secrets(message):
+    text = re.sub(r"postgres(?:ql)?://[^\s\"'<>]+", "[REDACTED]", str(message), flags=re.I)
+    try:
+        url = get_database_url()
+        if url:
+            text = text.replace(url, "[REDACTED]")
+            password = urlsplit(url).password
+            if password:
+                text = text.replace(password, "[REDACTED]").replace(unquote(password), "[REDACTED]")
+            for match in re.finditer(r"password\s*=\s*(?:'([^']*)'|([^\s]+))", url, re.I):
+                text = text.replace(match.group(1) or match.group(2), "[REDACTED]")
+    except Exception:
+        pass
+    return text
 
 
 def get_api_key():
@@ -103,10 +159,12 @@ def get_client():
 
 
 def safe_error(error):
-    if getattr(error, "public_message", False):
-        return str(error)
-    message = str(error)
+    if isinstance(error, StorageError):
+        return redact_storage_secrets(str(error))
+    if error.__class__.__module__.startswith(("psycopg", "sqlite3")):
+        return "Storage is unavailable, please try again"
+    message = redact_storage_secrets(str(error))
     key = get_api_key()
     if key:
         message = message.replace(key, "[REDACTED]")
-    return f"{type(error).__name__}: {message}"
+    return message if getattr(error, "public_message", False) else f"{type(error).__name__}: {message}"

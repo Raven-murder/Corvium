@@ -151,7 +151,7 @@ class JobManager:
             elif interruption.reason != "finished":
                 self._finish(job, "error", error="This chat or workspace changed while the answer was running.")
         except Exception as error:
-            message = str(error) if isinstance(error, UsageLimitError) else "The answer could not be completed. Please try again."
+            message = str(error) if isinstance(error, (UsageLimitError, config.StorageError)) else "The answer could not be completed. Please try again."
             self._finish(job, "error", error=message)
 
     def _finish(self, job, status, *, result=None, error=None):
@@ -186,10 +186,10 @@ class JobManager:
                     if user["created_at"] != job.user_created_at or user["role"] != "user":
                         raise ValueError("The original question is no longer available.")
                     message_id = add_message(job.chat_id, "assistant", content, sources=sources, kind=kind, error=status == "error")
-            except Exception:
+            except Exception as error:
                 with self.lock:
                     job.status = "error"
-                    job.error_message = "The answer could not be saved because this chat or workspace is no longer available."
+                    job.error_message = str(error) if isinstance(error, config.StorageError) else "The answer could not be saved because this chat or workspace is no longer available."
             finally:
                 with self.lock:
                     job.final_message_id = message_id
