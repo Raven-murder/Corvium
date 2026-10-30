@@ -112,6 +112,7 @@ class JobManager:
                        message_id, message_created_at, identity, language,
                        chat_created_at=chat_created_at, regenerate_plan_id=regenerate_plan_id)
             self.jobs[job.id] = job
+            bump_data_version(workspace_id)
             worker = Thread(target=perf.worker(self._run) if perf.ENABLED else self._run, args=(job, question, history, parameters, settings), daemon=True)
             self.workers[workspace_id] = worker
             try:
@@ -260,6 +261,8 @@ class JobManager:
                     job.final_plan_id = plan_id
                     if status == "done" and message_id is not None:
                         job.partial_text = content
+                    # Publish cache invalidation before exposing completion to pollers.
+                    bump_data_version(job.workspace_id)
                     job.finalized = True
                     job.updated_at = time.time()
 
@@ -292,13 +295,15 @@ class JobManager:
             "final_plan_id", "regenerate_plan_id"
         )} | {"cancel_requested": job.cancel_flag.is_set()}
 
-    def latest(self, workspace_id, chat_id=None, *, running_only=False):
+    def latest(self, workspace_id, chat_id=None, *, running_only=False, registry_only=False):
         from . import db
         workspace_id = validate_workspace_id(workspace_id)
         with self.lock:
             candidates = [job for job in self.jobs.values() if job.workspace_id == workspace_id
                           and (chat_id is None or job.chat_id == chat_id)
                           and (not running_only or job.status == "running" or not job.finalized)]
+            if registry_only:
+                return self._snapshot(max(candidates, key=lambda job: job.started)) if candidates else None
         if not candidates:
             return None
         if db.backend() == "postgres":
@@ -335,8 +340,8 @@ def start_tool_job(workspace_id, chat_id, kind, parameters, *, regenerate_plan_i
                           tool_parameters=parameters, regenerate_plan_id=regenerate_plan_id)
 
 
-def latest_job(workspace_id, chat_id):
-    return _MANAGER.latest(workspace_id, chat_id)
+def latest_job(workspace_id, chat_id=None, *, registry_only=False):
+    return _MANAGER.latest(workspace_id, chat_id, registry_only=registry_only)
 
 
 def cancel_job(workspace_id, chat_id, job_id):

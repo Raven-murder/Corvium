@@ -558,14 +558,14 @@ def stop_answer_job(state, chat_id, job_id):
 def live_answer_job(state, workspace_id, chat_id, message_ids):
     from .jobs import latest_job
 
-    if state.get("workspace_id") != workspace_id or state.get("selected_chat_id") != chat_id:
+    if state.get("workspace_id") != workspace_id:
         return None
-    job = latest_job(workspace_id, chat_id)
+    job = latest_job(workspace_id, registry_only=True)
     if job is None:
         return None
     if job["status"] == "running" or not job["finalized"]:
         return job
-    if job["final_message_id"] in message_ids or job["id"] in state.get("refreshed_jobs", set()):
+    if (job["chat_id"] == chat_id and job["final_message_id"] in message_ids) or job["id"] in state.get("refreshed_jobs", set()):
         return None
     return job
 

@@ -199,9 +199,8 @@ def show_chat_message(message, chat_id, scope="chat"):
             st.caption("Saved to notes.")
 
 
-@st.fragment(run_every=0.5)
+@st.fragment(run_every=1)
 @perf.entry("fragment:show_live_answer")
-@db.read_entry
 def show_live_answer(workspace_id, chat_id, message_ids):
     if st.query_params.get("w") != workspace_id:
         return
@@ -211,12 +210,15 @@ def show_live_answer(workspace_id, chat_id, message_ids):
         st.error(safe_error(error))
         return
     if job is None:
-        return
+        # Remove the scheduled fragment on the next full render.
+        st.rerun(scope="app")
     if job["status"] != "running" and job["finalized"]:
         flow.mark_job_refreshed(st.session_state, job["id"], job)
         if job["final_message_id"] is None:
             st.session_state.chat_notice = job["error_message"] or "The answer could not be saved. Please try again."
-        st.rerun()
+        st.rerun(scope="app")
+    if job["chat_id"] != chat_id:
+        return
     with st.chat_message("assistant", width="stretch"):
         if job["partial_text"]:
             if job["kind"] == "diagram":
@@ -228,7 +230,7 @@ def show_live_answer(workspace_id, chat_id, message_ids):
                         "diagram": "Drawing your diagram…"}.get(job["kind"], "Preparing your answer…"))
         if job["status"] == "running":
             st.button("Stop", icon=":material/stop:", key=f"stop_job_{job['id']}", disabled=job["cancel_requested"],
-                      on_click=run_callback, args=(flow.stop_answer_job, chat_id, job["id"]))
+                      on_click=run_callback, args=(flow.stop_answer_job, job["chat_id"], job["id"]))
         else:
             st.caption("Saving result…")
 
@@ -1013,6 +1015,8 @@ def main():
     if st.session_state.get("view") == "notes":
         if st.session_state.get("rail_dialog") != "notes":
             show_notes_view()
+        if flow.live_answer_job(st.session_state, st.session_state["workspace_id"], chat_id, set()) is not None:
+            show_live_answer(st.session_state["workspace_id"], chat_id, set())
         show_active_dialog()
         return
     if st.session_state.get("chat_notice"):
