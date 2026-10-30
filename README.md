@@ -151,7 +151,7 @@ flowchart LR
   EMB --> DB[("PostgreSQL or SQLite: chunks, files, memory, chats, notes")]
   UI --> RET["Retrieve the most relevant passages"]
   RET --> DB
-  RET --> LLM["Nemotron 3 Super on Token Factory"]
+  RET --> LLM["Nemotron 3.5 Lightning on Token Factory"]
   LLM --> UI
 ```
 
@@ -166,7 +166,7 @@ Everything runs on **Nebius Token Factory** through its OpenAI-compatible API, o
 
 | Task | Model |
 |---|---|
-| Answers, study plans, quizzes, diagram descriptions | `nvidia/nemotron-3-super-120b-a12b` (NVIDIA Nemotron) |
+| Answers, study plans, quizzes, diagram descriptions | `nvidia/Nemotron-3_5-Lightning` (NVIDIA Nemotron) |
 | Embeddings for retrieval and search | `Qwen/Qwen3-Embedding-8B` |
 | OCR of images and scanned pages | `Qwen/Qwen3.8-27B` (vision) |
 

@@ -18,7 +18,7 @@ APP_NAME = "Corvium"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
-CHAT_MODEL = os.getenv("NEBIUS_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+CHAT_MODEL = os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3_5-Lightning")
 DATA_DIR = PROJECT_ROOT / "data"
 _CLIENT_CONTEXT = ContextVar("generation_client_context", default=None)
 
