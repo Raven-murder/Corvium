@@ -203,8 +203,8 @@ Corvium needs your own Nebius Token Factory API key, and Nebius bills usage per 
 Requirements: Python 3.12, [Graphviz](https://graphviz.org/download/) with `dot` on your PATH, and a Nebius API key.
 
 ```
-git clone https://github.com/Raven-murder/Project-Zero-.git
-cd Project-Zero-
+   git clone https://github.com/Raven-murder/Corvium.git
+   cd Corvium
 python -m venv .venv
 .venv\Scripts\Activate.ps1        # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
